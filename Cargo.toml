@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/deltadrop-common",
+    "crates/deltadrop-relay",
+    "crates/deltadrop-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+lumenic = { git = "https://github.com/LensError/Lumenic.git" }
+deltadrop-common = { path = "crates/deltadrop-common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "net", "signal", "io-util"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+zstd = "0.13"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

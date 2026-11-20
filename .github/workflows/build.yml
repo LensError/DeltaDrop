@@ -1,0 +1,136 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay-linux:
+    name: Build deltadrop-relay (static musl)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: deltadrop-relay-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            artifact: deltadrop-relay-linux-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: mlugg/setup-zig@v2
+
+      - uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Strip client/lumenic from standalone relay build
+        run: sed -i '/deltadrop-client/d;/lumenic/d' Cargo.toml
+
+      - name: Lint, test, and build static musl binary
+        run: |
+          cargo clippy -p deltadrop-common -p deltadrop-relay --all-targets -- -D warnings
+          cargo test -p deltadrop-common -p deltadrop-relay
+          cargo zigbuild --release --target ${{ matrix.target }} -p deltadrop-relay
+
+      - name: Package relay binary and SHA256 checksum
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/deltadrop-relay dist/${{ matrix.artifact }}
+          chmod +x dist/${{ matrix.artifact }}
+          (cd dist && sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+
+  client:
+    name: Build deltadrop-client (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            ext: tar.gz
+          - os: windows-latest
+            target: windows-x86_64
+            ext: zip
+          - os: macos-latest
+            target: macos-universal
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
+      - name: Test, lint, and build client
+        run: |
+          cargo clippy -p deltadrop-client --all-targets -- -D warnings
+          cargo test -p deltadrop-client
+          cargo build --release -p deltadrop-client
+
+      - name: Package client artifact & SHA256 (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/deltadrop-client dist/
+          tar -czf dist/deltadrop-client-${{ matrix.target }}.tar.gz -C dist deltadrop-client
+          rm -f dist/deltadrop-client
+          (cd dist && sha256sum deltadrop-client-${{ matrix.target }}.tar.gz > deltadrop-client-${{ matrix.target }}.tar.gz.sha256)
+
+      - name: Package client artifact & SHA256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/deltadrop-client.exe dist/
+          Compress-Archive -Path dist/deltadrop-client.exe -DestinationPath dist/deltadrop-client-${{ matrix.target }}.zip -Force
+          Remove-Item dist/deltadrop-client.exe
+          $hash = (Get-FileHash dist/deltadrop-client-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  deltadrop-client-${{ matrix.target }}.zip" | Out-File -Encoding ascii dist/deltadrop-client-${{ matrix.target }}.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deltadrop-client-${{ matrix.target }}
+          path: dist/
+
+  release:
+    name: Publish Release Assets
+    needs: [relay-linux, client]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.relay-linux.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum $(ls -1 | grep -v '^SHA256SUMS$' | grep -v '\.sha256$') > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

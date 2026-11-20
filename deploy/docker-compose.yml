@@ -1,0 +1,42 @@
+services:
+  deltadrop-relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${DELTADROP_PORT:-8787}:8787"
+    environment:
+      DELTADROP_BIND: "0.0.0.0:8787"
+      DELTADROP_DATA_DIR: "/var/lib/deltadrop"
+      MAX_CACHE_GB: "${MAX_CACHE_GB:-50}"
+      CHUNK_TTL_HOURS: "${CHUNK_TTL_HOURS:-72}"
+      RELAY_NETWORK_SECRET: "${RELAY_NETWORK_SECRET:-}"
+      RUST_LOG: "deltadrop_relay=info"
+    volumes:
+      - deltadrop_data:/var/lib/deltadrop
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      TLS_DOMAIN: "${TLS_DOMAIN:?TLS_DOMAIN is required for tls profile}"
+    command: caddy reverse-proxy --from "${TLS_DOMAIN}" --to deltadrop-relay:8787
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - deltadrop-relay
+
+volumes:
+  deltadrop_data:
+  caddy_data:
+  caddy_config:

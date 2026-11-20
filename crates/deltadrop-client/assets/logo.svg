@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0B0F14"/>
+    </linearGradient>
+    <linearGradient id="deltaGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bgGrad)" stroke="#263040" stroke-width="4"/>
+  <path fill="url(#deltaGrad)" fill-rule="evenodd" d="M128 44 L212 196 L44 196 Z M128 84 L81 171 L175 171 Z"/>
+  <path fill="url(#deltaGrad)" d="M128 106 L151 142 C151 155 140.7 164 128 164 C115.3 164 105 155 105 142 Z"/>
+</svg>
