@@ -1043,6 +1043,9 @@ async fn run_sync_loop(
                             filter_cache = rebuild_filter_cache(&config);
                             collect_initial_changes(&config, &manifest, &mut dirty_paths);
                             if mode == SyncMode::Full {
+                                if config.target_peers.is_empty() {
+                                    let _ = register_and_discover_peers(&http, &mut config).await;
+                                }
                                 for peer in &config.target_peers {
                                     let _ = send_pull_request(&http, &config, peer, &folder_id, "*").await;
                                 }
@@ -1081,6 +1084,9 @@ async fn run_sync_loop(
                             rearm_watches(&mut _debouncer, &config, &filter_cache, &mut watched_dirs);
                             collect_initial_changes(&config, &manifest, &mut dirty_paths);
                             if mode == SyncMode::Full {
+                                if config.target_peers.is_empty() {
+                                    let _ = register_and_discover_peers(&http, &mut config).await;
+                                }
                                 for peer in &config.target_peers {
                                     let _ = send_pull_request(&http, &config, peer, &folder_id, "*").await;
                                 }
@@ -1226,6 +1232,8 @@ async fn run_sync_loop(
                             &config_path,
                             &snapshot,
                             &tracker,
+                            &lp_cfg_tx,
+                            paused,
                         )
                         .await;
                     }
@@ -1434,7 +1442,10 @@ async fn run_sync_cycle(
     let dl_remaining =
         process_incoming_deltas(http, config, manifest, tracker, Some(recent_writes)).await;
 
-    // 2. Upload dirty local changes with bounded concurrency (4 workers)
+    // 2. Process incoming pull requests so requested files enter dirty_paths immediately
+    process_pull_requests(http, config, manifest, dirty_paths).await;
+
+    // 3. Upload dirty local changes with bounded concurrency (4 workers)
     let batch: Vec<(String, String)> = dirty_paths.drain().collect();
     let sem = Arc::new(Semaphore::new(4));
     let mut join_set = JoinSet::new();
@@ -1473,9 +1484,6 @@ async fn run_sync_cycle(
             }
         }
     }
-
-    // 3. Process incoming pull requests from peers
-    process_pull_requests(http, config, manifest, dirty_paths).await;
 
     (dl_remaining, first_err)
 }
@@ -3280,6 +3288,7 @@ pub fn plan_non_destructive_relink(
     plan
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_account_and_update_cmd(
     cmd: SyncCommand,
     http: &Client,
@@ -3287,6 +3296,8 @@ async fn handle_account_and_update_cmd(
     config_path: &Path,
     snapshot: &Arc<Mutex<UiSnapshot>>,
     tracker: &SharedTracker,
+    lp_cfg_tx: &tokio::sync::watch::Sender<(ClientConfig, bool)>,
+    paused: bool,
 ) {
     match cmd {
         SyncCommand::Login {
@@ -3338,6 +3349,7 @@ async fn handle_account_and_update_cmd(
                     };
                     config.encryption_key = Some(deltadrop_common::encode_hex(&session.vault_key));
                     let _ = save_config_atomic(config_path, config);
+                    let _ = lp_cfg_tx.send((config.clone(), paused));
 
                     let (discovered, _) = register_and_discover_peers(http, config).await;
                     publish_all_folder_indices(http, config).await;
@@ -3403,6 +3415,7 @@ async fn handle_account_and_update_cmd(
             config.auth_token.clear();
             config.user_role = None;
             let _ = save_config_atomic(config_path, config);
+            let _ = lp_cfg_tx.send((config.clone(), paused));
             if let Ok(mut g) = snapshot.lock() {
                 g.username.clear();
                 g.user_role = None;

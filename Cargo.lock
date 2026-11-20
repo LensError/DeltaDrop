@@ -851,7 +851,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "deltadrop-client"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "deltadrop-common"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "blake3",
  "serde",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "deltadrop-relay"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "argon2",
