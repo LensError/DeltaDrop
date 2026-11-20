@@ -74,6 +74,55 @@ pub fn render_folders_view(
         })
         .px(24.0)
         .py(28.0);
+    }
+
+    if !snap.unmapped_remote_folders.is_empty() {
+        ui.col(|ui| {
+            ui.txt("AVAILABLE FROM PEERS")
+                .sz(11.0)
+                .tracking(0.08)
+                .fg(p.accent);
+            ui.divider().bg(p.border);
+            for rf in &snap.unmapped_remote_folders {
+                ui.row(|ui| {
+                    ui.col(|ui| {
+                        ui.txt(&rf.folder_id).sz(13.5).bold().fg(p.text);
+                        ui.txt(&format!(
+                            "Peer: {}  ·  {} subfolders",
+                            rf.source_peer, rf.subdir_count
+                        ))
+                        .sz(11.5)
+                        .fg(p.muted);
+                    })
+                    .gap(2.0);
+                    if ui
+                        .btn("Sync to This PC")
+                        .bg(p.surface)
+                        .bd(1.0, p.ok_green)
+                        .fg(p.ok_green)
+                        .sz(12.0)
+                        .px(10.0)
+                        .py(5.0)
+                        .clicked()
+                    {
+                        let dialog = app.pick_folder(&format!("Sync '{}' to folder", rf.folder_id));
+                        state.map_remote_picker = Some((rf.folder_id.clone(), dialog));
+                    }
+                })
+                .w_frac(1.0)
+                .py(10.0)
+                .justify_between()
+                .align_center();
+                ui.divider().bg(p.border);
+            }
+        })
+        .w_frac(1.0)
+        .px(24.0)
+        .py(12.0)
+        .gap(8.0);
+    }
+
+    if state.folders.is_empty() {
         return;
     }
 

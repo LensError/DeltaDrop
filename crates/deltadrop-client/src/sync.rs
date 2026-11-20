@@ -1357,9 +1357,39 @@ async fn run_sync_loop(
 
                 if online {
                     backoff_secs = 1;
+                    if !config.user_id.is_empty() && config.workspace_id != config.user_id {
+                        config.workspace_id = config.user_id.clone();
+                        let _ = save_config_atomic(&config_path, &config);
+                    }
                     let (discovered, added_new) = register_and_discover_peers(&http, &mut config).await;
                     if let Ok(mut g) = snapshot.lock() {
                         g.discovered_peers = discovered;
+                    }
+                    if !config.session_token.is_empty() {
+                        if let Ok(devs) = crate::auth_client::list_devices(
+                            &http,
+                            &config.relay_url,
+                            &config.session_token,
+                            config.network_secret.as_deref(),
+                        )
+                        .await
+                        {
+                            if let Ok(mut g) = snapshot.lock() {
+                                g.devices = devs;
+                            }
+                        }
+                        if let Ok(cache) = crate::auth_client::fetch_cache_status(
+                            &http,
+                            &config.relay_url,
+                            &config.session_token,
+                            config.network_secret.as_deref(),
+                        )
+                        .await
+                        {
+                            if let Ok(mut g) = snapshot.lock() {
+                                g.cache_status = cache;
+                            }
+                        }
                     }
                     if added_new {
                         collect_initial_changes(&config, &manifest, &mut dirty_paths);
@@ -3296,6 +3326,7 @@ async fn handle_account_and_update_cmd(
                     config.relay_url = parsed_relay;
                     config.username = session.username.clone();
                     config.user_id = session.user_id.clone();
+                    config.workspace_id = session.user_id.clone();
                     config.user_role = Some(session.role);
                     config.device_name = dev_name;
                     config.keep_unlocked = keep_unlocked;
@@ -3308,9 +3339,14 @@ async fn handle_account_and_update_cmd(
                     config.encryption_key = Some(deltadrop_common::encode_hex(&session.vault_key));
                     let _ = save_config_atomic(config_path, config);
 
+                    let (discovered, _) = register_and_discover_peers(http, config).await;
+                    publish_all_folder_indices(http, config).await;
+                    refresh_selective_views(http, config, tracker).await;
+
                     if let Ok(mut g) = snapshot.lock() {
                         g.username = session.username;
                         g.user_role = Some(session.role);
+                        g.discovered_peers = discovered;
                         g.active_config = Some(config.clone());
                         g.last_error = None;
                         g.online = true;
