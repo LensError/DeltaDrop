@@ -593,6 +593,18 @@ fn render_onboarding_overlay(
                     .bg(pal.surface)
                     .bd(1.0, pal.border);
 
+                ui.txt("NETWORK GATE (X-DeltaDrop-Gate, OPTIONAL)")
+                    .sz(10.5)
+                    .tracking(0.08)
+                    .fg(pal.muted);
+                ui.input("ob-gate", &mut state.network_secret)
+                    .placeholder("leave blank if disabled on relay")
+                    .w(380.0)
+                    .px(10.0)
+                    .py(8.0)
+                    .bg(pal.surface)
+                    .bd(1.0, pal.border);
+
                 if let Some(ref err) = snap.last_error {
                     ui.txt(err).sz(12.0).fg(pal.err_red);
                 }

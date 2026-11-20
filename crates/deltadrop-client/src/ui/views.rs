@@ -497,6 +497,24 @@ pub fn render_settings_view(
         .align_center();
 
         ui.row(|ui| {
+            ui.txt("Network Gate").sz(12.0).fg(p.muted).w(140.0);
+            if ui
+                .input("settings-network-gate", &mut state.network_secret)
+                .placeholder("X-DeltaDrop-Gate (optional)")
+                .w(260.0)
+                .px(8.0)
+                .py(5.0)
+                .bg(p.surface)
+                .bd(1.0, p.border)
+                .changed()
+            {
+                state.dirty = true;
+            }
+        })
+        .gap(12.0)
+        .align_center();
+
+        ui.row(|ui| {
             ui.txt("Keep Unlocked").sz(12.0).fg(p.muted).w(140.0);
             if ui
                 .btn(if state.keep_unlocked {
