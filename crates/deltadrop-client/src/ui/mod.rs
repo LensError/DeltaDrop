@@ -424,6 +424,7 @@ pub fn render_ui(ui: &mut UiContext, app: &mut App, handle: &SyncHandle, state: 
                 .is_some_and(|c| !c.session_token.is_empty());
 
         if !is_authenticated {
+            state.onboarding_step = 0;
             render_onboarding_overlay(ui, &snap, state, handle, pal);
         } else {
             // Minimalist flat text navigation tabs with 2px bottom accent indicator
@@ -634,11 +635,10 @@ fn render_onboarding_overlay(
                             },
                             keep_unlocked: state.keep_unlocked,
                         });
-                        state.onboarding_step = 1;
                     }
                 })
                 .py(6.0);
-            } else if state.onboarding_step == 1 {
+            } else {
                 ui.txt("Choose your first action")
                     .sz(18.0)
                     .bold()
