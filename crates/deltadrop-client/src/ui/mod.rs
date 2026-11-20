@@ -230,6 +230,11 @@ impl UiState {
         if self.dirty {
             return;
         }
+        if let Some(ref k) = cfg.encryption_key {
+            if self.encryption_key.text().trim() != k.trim() {
+                self.encryption_key.set_text(k);
+            }
+        }
         for active_f in &cfg.folders {
             if let Some(draft) = self
                 .folders

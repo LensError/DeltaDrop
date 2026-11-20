@@ -1132,10 +1132,23 @@ async fn run_sync_loop(
                     }
                     SyncCommand::UpdateConfig(mut new_cfg) => {
                         new_cfg.auth_token = new_cfg.auth_token.trim().to_string();
+                        if new_cfg.session_token.is_empty() && !config.session_token.is_empty() {
+                            new_cfg.session_token = config.session_token.clone();
+                        }
+                        if new_cfg.user_id.is_empty() && !config.user_id.is_empty() {
+                            new_cfg.user_id = config.user_id.clone();
+                        }
+                        if new_cfg.user_role.is_none() {
+                            new_cfg.user_role = config.user_role;
+                        }
+                        if new_cfg.username.is_empty() && !config.username.is_empty() {
+                            new_cfg.username = config.username.clone();
+                        }
                         new_cfg.encryption_key = new_cfg
                             .encryption_key
                             .map(|k| k.trim().to_string())
-                            .filter(|k| !k.is_empty());
+                            .filter(|k| !k.is_empty())
+                            .or_else(|| config.encryption_key.clone());
                         if let Err(msg) = validate_config(&new_cfg) {
                             tracker.push_activity(ActivityDirection::Info, "-", "-", format!("Config error: {msg}"));
                             if let Ok(mut g) = snapshot.lock() {
