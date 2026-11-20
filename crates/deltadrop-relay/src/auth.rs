@@ -270,9 +270,6 @@ pub async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if state.auth_token.is_empty() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
     let auth_header = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -283,13 +280,43 @@ pub async fn auth_middleware(
     let Some(token) = header.strip_prefix("Bearer ") else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    let auth_peer = if constant_time_eq_blake3(token.as_bytes(), state.auth_token.as_bytes()) {
+
+    let auth_peer = if !state.auth_token.is_empty()
+        && constant_time_eq_blake3(token.as_bytes(), state.auth_token.as_bytes())
+    {
         AuthPeer(None)
-    } else if let Some(peer_id) = verify_peer_token(&state.auth_token, token) {
-        AuthPeer(Some(peer_id))
+    } else if !state.auth_token.is_empty() {
+        if let Some(peer_id) = verify_peer_token(&state.auth_token, token) {
+            AuthPeer(Some(peer_id))
+        } else if validate_session_token(&state, token)? {
+            AuthPeer(None)
+        } else {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    } else if validate_session_token(&state, token)? {
+        AuthPeer(None)
     } else {
         return Err(StatusCode::UNAUTHORIZED);
     };
+
     req.extensions_mut().insert(auth_peer);
     Ok(next.run(req).await)
+}
+
+fn validate_session_token(state: &AppState, token: &str) -> Result<bool, StatusCode> {
+    let token_hash = hash_session_token(token);
+    let now = now_ms();
+    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let row = db
+        .query_row(
+            "SELECT u.disabled, s.expires_at_ms
+             FROM sessions s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.token_hash = ?1",
+            params![token_hash],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(matches!(row, Some((disabled, exp)) if disabled == 0 && exp > now))
 }

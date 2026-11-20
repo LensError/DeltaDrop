@@ -194,6 +194,33 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn effective_bearer(cfg: &ClientConfig) -> &str {
+    if !cfg.session_token.is_empty() {
+        &cfg.session_token
+    } else {
+        &cfg.auth_token
+    }
+}
+
+trait AuthReqExt {
+    fn with_client_auth(self, cfg: &ClientConfig) -> Self;
+}
+
+impl AuthReqExt for reqwest::RequestBuilder {
+    fn with_client_auth(self, cfg: &ClientConfig) -> Self {
+        let rb = self.bearer_auth(effective_bearer(cfg));
+        match cfg
+            .network_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(secret) => rb.header(deltadrop_common::GATE_HEADER, secret),
+            None => rb,
+        }
+    }
+}
+
 fn derive_workspace_keys(config: &ClientConfig) -> anyhow::Result<([u8; 32], [u8; 32])> {
     let secret = config
         .encryption_key
@@ -700,13 +727,13 @@ async fn register_and_discover_peers(
     http: &Client,
     config: &mut ClientConfig,
 ) -> (Vec<String>, bool) {
-    if config.auth_token.trim().is_empty() || config.peer_id.trim().is_empty() {
+    if effective_bearer(config).trim().is_empty() || config.peer_id.trim().is_empty() {
         return (Vec::new(), false);
     }
     let base = config.relay_url.trim_end_matches('/');
     let _ = http
         .post(format!("{base}/v1/peers/register"))
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .json(&PeerRegistration {
             peer_id: config.peer_id.clone(),
             workspace_id: config.workspace_id.clone(),
@@ -717,7 +744,7 @@ async fn register_and_discover_peers(
     let Ok(resp) = http
         .get(format!("{base}/v1/peers"))
         .query(&[("workspace_id", config.workspace_id.as_str())])
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -790,7 +817,7 @@ async fn fetch_events_long_poll(
     let resp = http
         .get(format!("{base}/v1/events"))
         .query(&[("peer", config.peer_id.as_str()), ("wait_secs", "25")])
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .send()
         .await?
         .error_for_status()?;
@@ -1136,7 +1163,7 @@ async fn run_sync_loop(
                                     ("source_peer", new_cfg.peer_id.as_str()),
                                     ("folder_id", rid.as_str()),
                                 ])
-                                .bearer_auth(&new_cfg.auth_token)
+                                .with_client_auth(&new_cfg)
                                 .send()
                                 .await;
                         }
@@ -1583,7 +1610,7 @@ async fn upload_one_path_item(
                 };
                 let meta_header = encode_meta_header(&meta)?;
                 http.put(format!("{base}/v1/deltas"))
-                    .bearer_auth(&config.auth_token)
+                    .with_client_auth(config)
                     .header("X-Delta-Meta", meta_header)
                     .body(encrypted)
                     .send()
@@ -1704,7 +1731,7 @@ async fn upload_one_path_item(
             .collect();
         let has_resp: HasChunksResponse = http
             .post(format!("{base}/v1/chunks/has"))
-            .bearer_auth(&config.auth_token)
+            .with_client_auth(config)
             .json(&HasChunksRequest { chunk_ids: all_ids })
             .send()
             .await?
@@ -1729,7 +1756,7 @@ async fn upload_one_path_item(
                 encrypt_chunk(&enc_key, &config.workspace_id, &spec.chunk_id, &compressed)?;
             uploaded_bytes += encrypted_chunk.len() as u64;
             http.put(format!("{base}/v1/chunks/{}", spec.chunk_id))
-                .bearer_auth(&config.auth_token)
+                .with_client_auth(config)
                 .body(encrypted_chunk)
                 .send()
                 .await?
@@ -1777,7 +1804,7 @@ async fn upload_one_path_item(
         };
         let meta_header = encode_meta_header(&meta)?;
         http.put(format!("{base}/v1/deltas"))
-            .bearer_auth(&config.auth_token)
+            .with_client_auth(config)
             .header("X-Delta-Meta", meta_header)
             .body(encrypted)
             .send()
@@ -1819,7 +1846,7 @@ async fn process_incoming_deltas(
     let Ok(resp) = http
         .get(format!("{base}/v1/deltas"))
         .query(&[("peer", &config.peer_id)])
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -1839,7 +1866,7 @@ async fn process_incoming_deltas(
         let Ok(blob_resp) = http
             .get(format!("{base}/v1/deltas/{}/blob", delta.id))
             .query(&[("peer", &config.peer_id)])
-            .bearer_auth(&config.auth_token)
+            .with_client_auth(config)
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -2010,7 +2037,7 @@ async fn process_incoming_deltas(
                     for chunk_ref in &env.chunks {
                         let c_resp = http
                             .get(format!("{base}/v1/chunks/{}", chunk_ref.chunk_id))
-                            .bearer_auth(&config.auth_token)
+                            .with_client_auth(config)
                             .send()
                             .await?
                             .error_for_status()?;
@@ -2229,7 +2256,7 @@ async fn send_ack(
 ) -> anyhow::Result<()> {
     let base = config.relay_url.trim_end_matches('/');
     http.post(format!("{base}/v1/ack"))
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .json(&AckRequest {
             target_peer: config.peer_id.clone(),
             delta_id,
@@ -2245,7 +2272,7 @@ async fn fetch_relay_status(http: &Client, config: &ClientConfig) -> anyhow::Res
     let base = config.relay_url.trim_end_matches('/');
     let resp = http
         .get(format!("{base}/v1/status"))
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .send()
         .await?;
     if resp.status() == reqwest::StatusCode::UPGRADE_REQUIRED {
@@ -2299,7 +2326,7 @@ async fn publish_all_folder_indices(http: &Client, config: &ClientConfig) {
         };
         let _ = http
             .put(format!("{base}/v1/folder-index"))
-            .bearer_auth(&config.auth_token)
+            .with_client_auth(config)
             .json(&payload)
             .send()
             .await;
@@ -2315,7 +2342,7 @@ async fn send_pull_request(
 ) -> anyhow::Result<()> {
     let base = config.relay_url.trim_end_matches('/');
     http.post(format!("{base}/v1/pull-requests"))
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .json(&PullRequest {
             source_peer: config.peer_id.clone(),
             target_peer: target_peer.to_string(),
@@ -2338,7 +2365,7 @@ async fn process_pull_requests(
     let Ok(resp) = http
         .get(format!("{base}/v1/pull-requests"))
         .query(&[("peer", &config.peer_id)])
-        .bearer_auth(&config.auth_token)
+        .with_client_auth(config)
         .send()
         .await
     else {
@@ -2400,7 +2427,7 @@ async fn process_pull_requests(
         }
         let _ = http
             .post(format!("{base}/v1/pull-requests/ack"))
-            .bearer_auth(&config.auth_token)
+            .with_client_auth(config)
             .json(&AckPullRequest {
                 target_peer: config.peer_id.clone(),
                 request_id: req.id,
@@ -2423,7 +2450,7 @@ async fn refresh_selective_views(http: &Client, config: &ClientConfig, tracker: 
         if let Ok(resp) = http
             .get(format!("{base}/v1/folder-indices"))
             .query(&[("source_peer", peer)])
-            .bearer_auth(&config.auth_token)
+            .with_client_auth(config)
             .send()
             .await
         {
