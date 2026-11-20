@@ -21,12 +21,13 @@ use crate::config::load_or_create_config;
 use crate::os_integration::SingleInstanceGuard;
 use crate::sync::spawn_sync_engine;
 
-fn parse_cli() -> (Option<PathBuf>, bool, bool, bool) {
+fn parse_cli() -> (Option<PathBuf>, bool, bool, bool, bool) {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<PathBuf> = None;
     let mut headless = false;
     let mut minimized = false;
     let mut inspect = false;
+    let mut restarted = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -38,10 +39,11 @@ fn parse_cli() -> (Option<PathBuf>, bool, bool, bool) {
             "--headless" => headless = true,
             "--minimized" => minimized = true,
             "--inspect" => inspect = true,
+            "--restarted" => restarted = true,
             _ => {}
         }
     }
-    (config_path, headless, minimized, inspect)
+    (config_path, headless, minimized, inspect, restarted)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let (cli_config_path, headless, start_minimized, inspect_mode) = parse_cli();
+    let (cli_config_path, headless, start_minimized, inspect_mode, restarted) = parse_cli();
 
     let safe_dir = SafeDir::from_mode(StorageMode::AppData {
         app_name: "deltadrop".to_string(),
@@ -81,7 +83,17 @@ fn main() -> anyhow::Result<()> {
     let mut instance_guard = if inspect_mode {
         None
     } else {
-        match SingleInstanceGuard::acquire(lock_dir) {
+        let mut acquired = SingleInstanceGuard::acquire(lock_dir);
+        if acquired.is_none() && restarted {
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(150));
+                acquired = SingleInstanceGuard::acquire(lock_dir);
+                if acquired.is_some() {
+                    break;
+                }
+            }
+        }
+        match acquired {
             Some(g) => Some(g),
             None => {
                 tracing::info!("DeltaDrop is already running; focused existing window.");

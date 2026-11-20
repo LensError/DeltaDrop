@@ -104,6 +104,19 @@ pub fn cleanup_old_windows_exe() {
     }
 }
 
+pub fn restart_self() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--restarted")
+        .collect();
+    std::process::Command::new(exe)
+        .args(args)
+        .arg("--restarted")
+        .spawn()?;
+    Ok(())
+}
+
 pub async fn check_for_updates(client: &Client) -> Result<UpdateStatus, String> {
     let resp = client
         .get(GITHUB_LATEST_URL)

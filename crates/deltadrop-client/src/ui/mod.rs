@@ -518,7 +518,7 @@ pub fn render_ui(ui: &mut UiContext, app: &mut App, handle: &SyncHandle, state: 
             ui.scroll("main-view-scroll", |ui| match state.active_tab {
                 1 => views::render_folders_view(ui, app, &snap, state, handle),
                 2 => views::render_devices_view(ui, &snap, state, handle),
-                3 => views::render_settings_view(ui, &snap, state, handle),
+                3 => views::render_settings_view(ui, app, &snap, state, handle),
                 4 if is_admin => views::render_users_view(ui, &snap, state, handle),
                 _ => dashboard::render_overview(ui, app, &snap, state, handle),
             })

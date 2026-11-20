@@ -498,6 +498,7 @@ pub fn render_devices_view(
 
 pub fn render_settings_view(
     ui: &mut UiContext,
+    app: &mut App,
     snap: &UiSnapshot,
     state: &mut UiState,
     sync: &SyncHandle,
@@ -665,9 +666,26 @@ pub fn render_settings_view(
                     }
                 }
                 Some(UpdateStatus::ReadyToRestart(v)) => {
-                    ui.txt(&format!("Update {v} staged. Restart DeltaDrop to apply."))
-                        .sz(12.0)
-                        .fg(p.ok_green);
+                    ui.row(|ui| {
+                        ui.txt(&format!("Update {v} ready"))
+                            .sz(12.0)
+                            .fg(p.ok_green);
+                        if ui
+                            .btn("Restart to Apply")
+                            .bg(p.ok_green)
+                            .fg(p.bg)
+                            .sz(12.0)
+                            .px(10.0)
+                            .py(5.0)
+                            .clicked()
+                            && crate::updater::restart_self().is_ok()
+                        {
+                            app.remove_tray_icon();
+                            app.request_exit();
+                        }
+                    })
+                    .gap(10.0)
+                    .align_center();
                 }
                 Some(UpdateStatus::UpToDate(_)) => {
                     ui.txt("Up to date").sz(12.0).fg(p.ok_green);
