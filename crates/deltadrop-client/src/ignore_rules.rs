@@ -9,6 +9,9 @@ const INTERNAL_SAFETY_PATTERNS: &[&str] = &[
     "*.sync-conflict-*",
     ".deltadropignore",
     ".deltadropignore.tmp",
+    ".deltadrop-share",
+    ".deltadrop-baseline.json",
+    ".deltadrop-baseline.json.tmp*",
 ];
 
 pub struct IgnorePreset {

@@ -65,14 +65,6 @@ pub fn render_login_screen(
                 .px(10.0)
                 .py(7.0);
 
-            field_label(ui, "Network Gate Secret (optional)", &p);
-            ui.password_input("login_gate_secret", &mut state.network_secret)
-                .w_frac(1.0)
-                .bg(p.bg)
-                .bd(1.0, p.border)
-                .px(10.0)
-                .py(7.0);
-
             ui.row(|ui| {
                 ui.checkbox("Keep signed in on this PC", &mut state.keep_unlocked);
             });
@@ -92,14 +84,13 @@ pub fn render_login_screen(
                 .fg(p.bg)
                 .clicked()
             {
-                let secret = state.network_secret.text().trim().to_string();
                 sync.send(SyncCommand::Login {
                     relay_url: state.relay_url.text().to_string(),
                     username: state.username.text().to_string(),
                     password: state.password.text().to_string(),
                     device_name: state.device_name.text().to_string(),
                     keep_unlocked: state.keep_unlocked,
-                    network_secret: if secret.is_empty() { None } else { Some(secret) },
+                    network_secret: None,
                 });
                 state.password.set_text("");
             }
@@ -396,14 +387,6 @@ pub fn render_settings_view(
         .w_frac(1.0)
         .gap(8.0);
 
-        field_label(ui, "Network Gate Secret (leave blank to keep unchanged)", &p);
-        ui.password_input("settings_gate_secret", &mut state.network_secret)
-            .w_frac(1.0)
-            .bg(p.bg)
-            .bd(1.0, p.border)
-            .px(10.0)
-            .py(6.0);
-
         ui.checkbox("Keep signed in across restarts", &mut state.keep_unlocked);
         ui.checkbox("Automatically check for updates", &mut state.auto_check_updates);
 
@@ -426,17 +409,12 @@ pub fn render_settings_view(
                 .fg(p.bg)
                 .clicked()
             {
-                let sec_txt = state.network_secret.text().trim().to_string();
                 sync.send(SyncCommand::SaveSettings {
                     relay_url: state.relay_url.text().to_string(),
                     device_name: state.device_name.text().to_string(),
                     default_sync_root: PathBuf::from(state.default_sync_root.text().trim()),
                     keep_unlocked: state.keep_unlocked,
-                    network_secret: if sec_txt.is_empty() {
-                        None
-                    } else {
-                        Some(sec_txt)
-                    },
+                    network_secret: None,
                     auto_check_updates: state.auto_check_updates,
                 });
             }

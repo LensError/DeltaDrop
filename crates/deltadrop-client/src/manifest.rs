@@ -1,15 +1,71 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+pub const IN_FOLDER_BASELINE_FILE: &str = ".deltadrop-baseline.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineEntry {
     pub blake3_hash: String,
     pub size: u64,
     pub mtime_ms: i64,
     pub rev: u64,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedBaselineFile {
+    pub share_id: String,
+    pub synced_version: u64,
+    pub last_sync_ms: i64,
+    pub entries: HashMap<String, BaselineEntry>,
+}
+
+pub fn write_hidden_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .attributes(FILE_ATTRIBUTE_HIDDEN)
+            .open(path)
+        {
+            f.write_all(content)?;
+            return Ok(());
+        }
+    }
+    std::fs::write(path, content)
+}
+
+pub fn load_in_folder_baseline(share_root: &Path, share_id: &str) -> Option<SharedBaselineFile> {
+    let path = share_root.join(IN_FOLDER_BASELINE_FILE);
+    let raw = std::fs::read(&path).ok()?;
+    let parsed: SharedBaselineFile = serde_json::from_slice(&raw).ok()?;
+    if parsed.share_id != share_id {
+        return None;
+    }
+    Some(parsed)
+}
+
+pub fn save_in_folder_baseline(
+    share_root: &Path,
+    state: &SharedBaselineFile,
+) -> anyhow::Result<()> {
+    let path = share_root.join(IN_FOLDER_BASELINE_FILE);
+    let tmp_path = share_root.join(format!("{IN_FOLDER_BASELINE_FILE}.tmp"));
+    let json = serde_json::to_vec(state)?;
+    write_hidden_file(&tmp_path, &json)?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

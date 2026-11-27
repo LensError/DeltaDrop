@@ -33,10 +33,53 @@ pub enum PutShareResult {
     Conflict,
 }
 
+pub fn normalize_relay_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+
+    let host_port = trimmed.split('/').next().unwrap_or("");
+    let (host, has_port) = if let Some(rest) = host_port.strip_prefix('[') {
+        if let Some((h, after)) = rest.split_once(']') {
+            (h, after.starts_with(':'))
+        } else {
+            (host_port, false)
+        }
+    } else if let Some((h, port_str)) = host_port.rsplit_once(':') {
+        if !port_str.is_empty() && port_str.bytes().all(|b| b.is_ascii_digit()) {
+            (h, true)
+        } else {
+            (host_port, false)
+        }
+    } else {
+        (host_port, false)
+    };
+
+    let use_http = if host.eq_ignore_ascii_case("localhost")
+        || matches!(host, "127.0.0.1" | "::1")
+        || host.to_ascii_lowercase().ends_with(".ts.net")
+    {
+        true
+    } else if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        let octets = ip.octets();
+        let is_tailscale = octets[0] == 100 && (64..=127).contains(&octets[1]);
+        is_tailscale || (has_port && (ip.is_private() || ip.is_loopback() || ip.is_link_local()))
+    } else {
+        false
+    };
+
+    let scheme = if use_http { "http://" } else { "https://" };
+    format!("{scheme}{trimmed}")
+}
+
 impl RelayClient {
     pub fn new(base_url: &str, token: &str, network_secret: Option<&str>) -> Self {
         Self {
-            base_url: base_url.trim().trim_end_matches('/').to_string(),
+            base_url: normalize_relay_url(base_url),
             token: token.trim().to_string(),
             network_secret: network_secret
                 .map(str::trim)
@@ -400,4 +443,21 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_relay_url;
+
+    #[test]
+    fn normalize_relay_url_schemes() {
+        assert_eq!(normalize_relay_url("localhost:8080/"), "http://localhost:8080");
+        assert_eq!(normalize_relay_url("127.0.0.1:9000"), "http://127.0.0.1:9000");
+        assert_eq!(normalize_relay_url("100.101.102.103:8080"), "http://100.101.102.103:8080");
+        assert_eq!(normalize_relay_url("my-pc.tailnet-abc.ts.net"), "http://my-pc.tailnet-abc.ts.net");
+        assert_eq!(normalize_relay_url("192.168.1.42:8080"), "http://192.168.1.42:8080");
+        assert_eq!(normalize_relay_url("sync.example.com"), "https://sync.example.com");
+        assert_eq!(normalize_relay_url("https://sync.example.com/"), "https://sync.example.com");
+        assert_eq!(normalize_relay_url("http://192.168.1.42:8080/"), "http://192.168.1.42:8080");
+    }
 }

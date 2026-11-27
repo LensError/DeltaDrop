@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -26,13 +26,20 @@ use crate::crypto::{
     encrypt_manifest,
 };
 use crate::ignore_rules::{detect_project_ignore_patterns, write_ignore_file, IgnoreFilter};
-use crate::manifest::{BaselineEntry, ConflictRow, LocalStateDb};
-use crate::relay_client::{PutShareResult, RelayClient};
+use crate::manifest::{
+    load_in_folder_baseline, save_in_folder_baseline, write_hidden_file, BaselineEntry,
+    ConflictRow, LocalStateDb, SharedBaselineFile,
+};
+use crate::relay_client::{normalize_relay_url, PutShareResult, RelayClient};
 use crate::updater::{self, UpdateStatus};
 
 const MAX_ACTIVITY: usize = 80;
 const CHUNK_WORKERS: usize = 4;
 const MAX_CONFLICT_RETRIES: usize = 4;
+const SHARE_MARKER_FILE: &str = ".deltadrop-share";
+const STREAM_BUF_CAP: usize = 8 * 1024 * 1024;
+const LOCK_RETRY_DELAYS_MS: &[u64] = &[50, 150, 300];
+const LOCK_REQUEUE_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct DecryptedDeviceInfo {
@@ -362,6 +369,7 @@ struct SyncWorker {
     watch_rx: mpsc::Receiver<Vec<PathBuf>>,
     watched_roots: HashMap<String, PathBuf>,
     dirty_shares: HashSet<String>,
+    retry_shares: HashMap<String, Instant>,
     self_write_until: HashMap<String, Instant>,
     remote_records: HashMap<String, ShareRecord>,
     remote_manifests: HashMap<String, ShareManifest>,
@@ -418,6 +426,7 @@ impl SyncWorker {
             watch_rx,
             watched_roots: HashMap::new(),
             dirty_shares: HashSet::new(),
+            retry_shares: HashMap::new(),
             self_write_until: HashMap::new(),
             remote_records: HashMap::new(),
             remote_manifests: HashMap::new(),
@@ -497,6 +506,20 @@ impl SyncWorker {
             self.poll_ws();
             self.poll_file_watcher();
 
+            if !self.retry_shares.is_empty() {
+                let now = Instant::now();
+                let due: Vec<String> = self
+                    .retry_shares
+                    .iter()
+                    .filter(|(_, when)| **when <= now)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in due {
+                    self.retry_shares.remove(&id);
+                    self.dirty_shares.insert(id);
+                }
+            }
+
             if !self.global_paused && !self.dirty_shares.is_empty() {
                 let pending: Vec<String> = self.dirty_shares.drain().collect();
                 for share_id in pending {
@@ -524,7 +547,7 @@ impl SyncWorker {
                 keep_unlocked,
                 network_secret,
             } => {
-                let clean_url = relay_url.trim().trim_end_matches('/').to_string();
+                let clean_url = normalize_relay_url(&relay_url);
                 let clean_name = if device_name.trim().is_empty() {
                     self.config.device_name.clone()
                 } else {
@@ -646,6 +669,7 @@ impl SyncWorker {
                     ignore_patterns
                 };
                 let _ = write_ignore_file(&local_path, &patterns);
+                let _ = ensure_share_marker(&local_path, &share_id);
                 let binding = LocalShareBinding {
                     share_id: share_id.clone(),
                     name: name.clone(),
@@ -701,6 +725,7 @@ impl SyncWorker {
                     paused: false,
                 };
                 let _ = write_ignore_file(&target_path, &binding.ignore_patterns);
+                let _ = ensure_share_marker(&target_path, &share_id);
                 self.config.shares.push(binding);
                 let _ = save_config_atomic(&self.config_path, &self.config);
                 self.reconcile_watchers();
@@ -905,7 +930,7 @@ impl SyncWorker {
                 network_secret,
                 auto_check_updates,
             } => {
-                let clean_url = relay_url.trim().trim_end_matches('/').to_string();
+                let clean_url = normalize_relay_url(&relay_url);
                 let url_changed = clean_url != self.config.relay_url;
                 self.config.relay_url = clean_url;
                 if !device_name.trim().is_empty() {
@@ -1540,6 +1565,10 @@ impl SyncWorker {
 
         match res {
             Ok(outcome) => {
+                if outcome.skipped_locked > 0 {
+                    self.retry_shares
+                        .insert(share_id.to_string(), Instant::now() + LOCK_REQUEUE_DELAY);
+                }
                 let clock = format_clock_now();
                 let state = if outcome.missing_chunks > 0 {
                     ShareSyncState::WaitingForHost
@@ -1550,6 +1579,11 @@ impl SyncWorker {
                     format!(
                         "Waiting for another PC to re-upload {} evicted chunks",
                         outcome.missing_chunks
+                    )
+                } else if outcome.skipped_locked > 0 {
+                    format!(
+                        "Skipped {} locked file(s), retrying...",
+                        outcome.skipped_locked
                     )
                 } else if outcome.uploaded_files > 0 || outcome.downloaded_files > 0 {
                     format!(
@@ -1577,15 +1611,21 @@ impl SyncWorker {
                     if outcome.uploaded_files > 0
                         || outcome.downloaded_files > 0
                         || outcome.conflicts_created > 0
+                        || outcome.skipped_locked > 0
                     {
                         s.push_activity(
                             format!(
-                                "'{}': v{} ({} up, {} down, {} conflicts)",
+                                "'{}': v{} ({} up, {} down, {} conflicts{})",
                                 binding.name,
                                 outcome.version,
                                 outcome.uploaded_files,
                                 outcome.downloaded_files,
-                                outcome.conflicts_created
+                                outcome.conflicts_created,
+                                if outcome.skipped_locked > 0 {
+                                    format!(", {} locked", outcome.skipped_locked)
+                                } else {
+                                    String::new()
+                                }
                             ),
                             false,
                         );
@@ -1629,7 +1669,8 @@ impl SyncWorker {
         }
         let wanted: HashSet<&str> = chunk_ids.iter().map(String::as_str).collect();
         let filter = IgnoreFilter::from_patterns(&binding.local_path, &binding.ignore_patterns);
-        let Ok((local_files, _)) = scan_local_dir(&binding.local_path, &filter, &HashMap::new())
+        let Ok((local_files, _, _)) =
+            scan_local_dir(&binding.local_path, &filter, &HashMap::new())
         else {
             return;
         };
@@ -1671,6 +1712,7 @@ pub struct ShareSyncOutcome {
     pub downloaded_files: usize,
     pub conflicts_created: usize,
     pub missing_chunks: usize,
+    pub skipped_locked: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1680,18 +1722,165 @@ struct LocalFileMeta {
     blake3_hash: String,
 }
 
+fn ensure_share_marker(root: &Path, share_id: &str) -> anyhow::Result<()> {
+    let marker = root.join(SHARE_MARKER_FILE);
+    if let Ok(existing) = fs::read_to_string(&marker) {
+        if existing.trim() == share_id {
+            return Ok(());
+        }
+    }
+    write_hidden_file(&marker, share_id.as_bytes())?;
+    Ok(())
+}
+
+fn is_file_lock_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error() {
+        // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33)
+        if matches!(code, 5 | 32 | 33) {
+            return true;
+        }
+    }
+    false
+}
+
+fn retry_on_lock<T, F: FnMut() -> std::io::Result<T>>(mut op: F) -> std::io::Result<T> {
+    let mut last_err = None;
+    for (attempt, &delay_ms) in std::iter::once(&0)
+        .chain(LOCK_RETRY_DELAYS_MS.iter())
+        .enumerate()
+    {
+        if attempt > 0 && delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_file_lock_error(&e) => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("retry_on_lock must record an error"))
+}
+
+struct StreamedChunk {
+    chunk_ref: ChunkRef,
+    offset: u64,
+    len: usize,
+}
+
+struct StreamedFile {
+    size: u64,
+    blake3_hash: String,
+    chunks: Vec<StreamedChunk>,
+}
+
+fn stream_chunk_file(path: &Path, vault_key: &[u8; 32]) -> std::io::Result<StreamedFile> {
+    let mut file = File::open(path)?;
+    let mut file_hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_BUF_CAP];
+    let mut filled = 0usize;
+    let mut eof = false;
+    let mut file_offset = 0u64;
+    let mut chunks = Vec::new();
+
+    loop {
+        while !eof && filled < STREAM_BUF_CAP {
+            let n = file.read(&mut buf[filled..])?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+
+        let mut offset = 0usize;
+        while offset < filled {
+            // Keep at least CHUNK_MAX_SIZE in the window unless we hit EOF so FastCDC sees the full window.
+            if !eof && (filled - offset) < CHUNK_MAX_SIZE {
+                break;
+            }
+            let len = next_fastcdc_boundary(&buf[offset..filled], CHUNK_MIN_SIZE, CHUNK_MAX_SIZE);
+            let step = len.max(1).min(filled - offset);
+            let slice = &buf[offset..offset + step];
+
+            file_hasher.update(slice);
+            let cid = compute_chunk_id(vault_key, slice);
+            let plain_hash = blake3::hash(slice).to_hex().to_string();
+            chunks.push(StreamedChunk {
+                chunk_ref: ChunkRef {
+                    chunk_id: cid,
+                    raw_size: step as u64,
+                    plaintext_blake3: plain_hash,
+                },
+                offset: file_offset,
+                len: step,
+            });
+            file_offset += step as u64;
+            offset += step;
+        }
+
+        if offset > 0 {
+            buf.copy_within(offset..filled, 0);
+            filled -= offset;
+        }
+        if eof && filled == 0 {
+            break;
+        }
+    }
+
+    Ok(StreamedFile {
+        size: file_offset,
+        blake3_hash: file_hasher.finalize().to_hex().to_string(),
+        chunks,
+    })
+}
+
+fn read_chunk_from_file(path: &Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+type LocalScanResult = (
+    HashMap<String, LocalFileMeta>,
+    BTreeSet<String>,
+    HashSet<String>,
+);
+
 fn scan_local_dir(
     root: &Path,
     filter: &IgnoreFilter,
     baseline: &HashMap<String, BaselineEntry>,
-) -> anyhow::Result<(HashMap<String, LocalFileMeta>, BTreeSet<String>)> {
+) -> anyhow::Result<LocalScanResult> {
     let mut files = HashMap::new();
     let mut empty_dirs = BTreeSet::new();
+    let mut locked_files = HashSet::new();
     if !root.exists() {
-        return Ok((files, empty_dirs));
+        return Ok((files, empty_dirs, locked_files));
     }
-    scan_dir_rec(root, root, filter, baseline, &mut files, &mut empty_dirs)?;
-    Ok((files, empty_dirs))
+    scan_dir_rec(
+        root,
+        root,
+        filter,
+        baseline,
+        &mut files,
+        &mut empty_dirs,
+        &mut locked_files,
+    )?;
+    Ok((files, empty_dirs, locked_files))
 }
 
 fn scan_dir_rec(
@@ -1701,6 +1890,7 @@ fn scan_dir_rec(
     baseline: &HashMap<String, BaselineEntry>,
     files: &mut HashMap<String, LocalFileMeta>,
     empty_dirs: &mut BTreeSet<String>,
+    locked_files: &mut HashSet<String>,
 ) -> anyhow::Result<bool> {
     let mut has_synced_content = false;
     for entry in fs::read_dir(dir)? {
@@ -1720,7 +1910,15 @@ fn scan_dir_rec(
             if !filter.should_sync(&rel, true) {
                 continue;
             }
-            let child_has_content = scan_dir_rec(root, &path, filter, baseline, files, empty_dirs)?;
+            let child_has_content = scan_dir_rec(
+                root,
+                &path,
+                filter,
+                baseline,
+                files,
+                empty_dirs,
+                locked_files,
+            )?;
             if !child_has_content {
                 empty_dirs.insert(rel);
             }
@@ -1729,7 +1927,15 @@ fn scan_dir_rec(
             if !filter.should_sync(&rel, false) {
                 continue;
             }
-            let meta = entry.metadata()?;
+            let meta = match retry_on_lock(|| entry.metadata()) {
+                Ok(m) => m,
+                Err(e) if is_file_lock_error(&e) => {
+                    locked_files.insert(rel);
+                    has_synced_content = true;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let size = meta.len();
             let mtime_ms = meta
                 .modified()
@@ -1743,7 +1949,15 @@ fn scan_dir_rec(
                 Some(b) if !b.deleted && b.size == size && b.mtime_ms == mtime_ms => {
                     b.blake3_hash.clone()
                 }
-                _ => hash_file_blake3(&path)?,
+                _ => match retry_on_lock(|| hash_file_blake3(&path)) {
+                    Ok(h) => h,
+                    Err(e) if is_file_lock_error(&e) => {
+                        locked_files.insert(rel);
+                        has_synced_content = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                },
             };
             files.insert(
                 rel,
@@ -1759,7 +1973,7 @@ fn scan_dir_rec(
     Ok(has_synced_content)
 }
 
-fn hash_file_blake3(path: &Path) -> anyhow::Result<String> {
+fn hash_file_blake3(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher)?;
@@ -1801,11 +2015,21 @@ pub fn sync_share_once<F>(
 where
     F: Fn(&str, u64, u64) + Sync,
 {
-    fs::create_dir_all(&binding.local_path)?;
+    let db_version = db.get_synced_version(&binding.share_id)?;
+    if db_version > 0 {
+        let marker_path = binding.local_path.join(SHARE_MARKER_FILE);
+        if !binding.local_path.is_dir() || !marker_path.is_file() {
+            anyhow::bail!("Folder missing or drive unmounted");
+        }
+    } else {
+        fs::create_dir_all(&binding.local_path)?;
+        ensure_share_marker(&binding.local_path, &binding.share_id)?;
+    }
 
     let mut total_uploaded_files = 0usize;
     let mut total_downloaded_files = 0usize;
     let mut total_conflicts = 0usize;
+    let mut total_skipped_locked = 0usize;
 
     for attempt in 0..MAX_CONFLICT_RETRIES {
         let remote_rec = client.get_share(&binding.share_id)?;
@@ -1822,7 +2046,14 @@ where
             None => (0, None),
         };
 
-        let synced_version = db.get_synced_version(&binding.share_id)?;
+        let in_folder = load_in_folder_baseline(&binding.local_path, &binding.share_id);
+        let (synced_version, baseline) = match in_folder {
+            Some(ref f) if f.synced_version >= db_version => {
+                (f.synced_version, f.entries.clone())
+            }
+            _ => (db_version, db.list_baseline(&binding.share_id)?),
+        };
+
         // If we haven't synced this share yet and remote has ignore patterns, adopt them.
         if synced_version == 0 {
             if let Some(ref rm) = remote_manifest {
@@ -1834,8 +2065,7 @@ where
         }
 
         let filter = IgnoreFilter::from_patterns(&binding.local_path, &binding.ignore_patterns);
-        let baseline = db.list_baseline(&binding.share_id)?;
-        let (local_files, local_empty_dirs) =
+        let (local_files, local_empty_dirs, mut skipped_locked) =
             scan_local_dir(&binding.local_path, &filter, &baseline)?;
 
         let remote_map: HashMap<String, ManifestFileEntry> = remote_manifest
@@ -1870,6 +2100,12 @@ where
             if !filter.should_sync(&rel, false) {
                 continue;
             }
+            if skipped_locked.contains(&rel) {
+                if let Some(r) = remote_map.get(&rel) {
+                    merged_files.insert(rel, r.clone());
+                }
+                continue;
+            }
             let local = local_files.get(&rel);
             let base = baseline.get(&rel);
             let remote = remote_map.get(&rel);
@@ -1901,11 +2137,19 @@ where
                         let conflict_path =
                             build_conflict_path(&binding.local_path, &rel, device_id);
                         let src_path = binding.local_path.join(&rel);
-                        fs::copy(&src_path, &conflict_path).map_err(|e| {
-                            anyhow::anyhow!(
-                                "Aborting conflict overwrite for '{rel}': backup failed ({e})"
-                            )
-                        })?;
+                        match retry_on_lock(|| fs::copy(&src_path, &conflict_path)) {
+                            Ok(_) => {}
+                            Err(e) if is_file_lock_error(&e) => {
+                                skipped_locked.insert(rel.clone());
+                                merged_files.insert(rel, r.clone());
+                                continue;
+                            }
+                            Err(e) => {
+                                anyhow::bail!(
+                                    "Aborting conflict overwrite for '{rel}': backup failed ({e})"
+                                );
+                            }
+                        }
                         let _ = db.push_conflict(
                             &binding.share_id,
                             &binding.name,
@@ -1970,7 +2214,11 @@ where
         for rel in &to_delete_local {
             let full = binding.local_path.join(rel);
             if full.is_file() {
-                let _ = fs::remove_file(&full);
+                if let Err(e) = retry_on_lock(|| fs::remove_file(&full)) {
+                    if is_file_lock_error(&e) {
+                        skipped_locked.insert(rel.clone());
+                    }
+                }
             }
         }
 
@@ -1998,10 +2246,17 @@ where
                         if let Some(parent) = dst.parent() {
                             fs::create_dir_all(parent)?;
                         }
-                        if fs::copy(existing_src, &dst).is_ok() {
-                            set_mtime_ms(&dst, entry.mtime_ms);
-                            total_downloaded_files += 1;
-                            continue;
+                        match retry_on_lock(|| fs::copy(existing_src, &dst)) {
+                            Ok(_) => {
+                                set_mtime_ms(&dst, entry.mtime_ms);
+                                total_downloaded_files += 1;
+                                continue;
+                            }
+                            Err(e) if is_file_lock_error(&e) => {
+                                skipped_locked.insert(entry.rel_path.clone());
+                                continue;
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -2117,11 +2372,25 @@ where
                     anyhow::bail!("Hash mismatch after downloading '{}'", entry.rel_path);
                 }
                 set_mtime_ms(&tmp_path, entry.mtime_ms);
-                if dst.exists() {
-                    let _ = fs::remove_file(&dst);
+                let replace_res = retry_on_lock(|| {
+                    if dst.exists() {
+                        fs::remove_file(&dst)?;
+                    }
+                    fs::rename(&tmp_path, &dst)
+                });
+                match replace_res {
+                    Ok(()) => {
+                        total_downloaded_files += 1;
+                    }
+                    Err(e) if is_file_lock_error(&e) => {
+                        let _ = fs::remove_file(&tmp_path);
+                        skipped_locked.insert(entry.rel_path.clone());
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(e.into());
+                    }
                 }
-                fs::rename(&tmp_path, &dst)?;
-                total_downloaded_files += 1;
             }
 
             if !missing_chunks.is_empty() {
@@ -2151,7 +2420,7 @@ where
             }
         }
 
-        // Upload phase.
+        // Upload phase (streaming FastCDC chunking + bounded memory).
         if !to_upload.is_empty() {
             let total_up_bytes: u64 = to_upload
                 .iter()
@@ -2160,26 +2429,36 @@ where
                 .sum();
             on_progress("Chunking local changes...", 0, total_up_bytes);
 
-            let mut chunk_payloads: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut chunk_locations: HashMap<String, (PathBuf, u64, usize)> = HashMap::new();
+            let mut cid_to_rels: HashMap<String, Vec<String>> = HashMap::new();
+            let mut staged_uploads: Vec<String> = Vec::new();
+
             for rel in &to_upload {
                 let full = binding.local_path.join(rel);
-                let bytes = fs::read(&full)?;
-                let hash = blake3::hash(&bytes).to_hex().to_string();
+                let streamed = match retry_on_lock(|| stream_chunk_file(&full, vault_key)) {
+                    Ok(s) => s,
+                    Err(e) if is_file_lock_error(&e) => {
+                        skipped_locked.insert(rel.clone());
+                        if let Some(r) = remote_map.get(rel) {
+                            merged_files.insert(rel.clone(), r.clone());
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 let meta = local_files.get(rel).cloned().unwrap_or(LocalFileMeta {
-                    size: bytes.len() as u64,
+                    size: streamed.size,
                     mtime_ms: now_ms(),
-                    blake3_hash: hash.clone(),
+                    blake3_hash: streamed.blake3_hash.clone(),
                 });
-                let mut refs = Vec::new();
-                for slice in chunk_bytes(&bytes) {
-                    let cid = compute_chunk_id(vault_key, slice);
-                    let plain_hash = blake3::hash(slice).to_hex().to_string();
-                    refs.push(ChunkRef {
-                        chunk_id: cid.clone(),
-                        raw_size: slice.len() as u64,
-                        plaintext_blake3: plain_hash,
-                    });
-                    chunk_payloads.entry(cid).or_insert_with(|| slice.to_vec());
+                let mut refs = Vec::with_capacity(streamed.chunks.len());
+                for sc in streamed.chunks {
+                    let cid = sc.chunk_ref.chunk_id.clone();
+                    cid_to_rels.entry(cid.clone()).or_default().push(rel.clone());
+                    chunk_locations
+                        .entry(cid)
+                        .or_insert_with(|| (full.clone(), sc.offset, sc.len));
+                    refs.push(sc.chunk_ref);
                 }
                 let prev_rev = remote_map
                     .get(rel)
@@ -2190,32 +2469,34 @@ where
                     rel.clone(),
                     ManifestFileEntry {
                         rel_path: rel.clone(),
-                        size: bytes.len() as u64,
+                        size: streamed.size,
                         mtime_ms: meta.mtime_ms,
                         mode_bits: 0,
-                        blake3_hash: hash,
+                        blake3_hash: streamed.blake3_hash,
                         rev: prev_rev.saturating_add(1),
                         deleted: false,
                         chunks: refs,
                     },
                 );
+                staged_uploads.push(rel.clone());
             }
 
-            let all_cids: Vec<String> = chunk_payloads.keys().cloned().collect();
+            let all_cids: Vec<String> = chunk_locations.keys().cloned().collect();
             let mut missing_on_relay: Vec<String> = Vec::new();
             for batch in all_cids.chunks(256) {
                 let miss = client.has_chunks(batch.to_vec())?;
                 missing_on_relay.extend(miss);
             }
 
+            let locked_cids: Mutex<Vec<String>> = Mutex::new(Vec::new());
             if !missing_on_relay.is_empty() {
                 let done_up = Arc::new(AtomicU64::new(0));
                 let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
                 let next_idx = AtomicU64::new(0);
                 let upload_total: u64 = missing_on_relay
                     .iter()
-                    .filter_map(|id| chunk_payloads.get(id))
-                    .map(|v| v.len() as u64)
+                    .filter_map(|id| chunk_locations.get(id))
+                    .map(|(_, _, len)| *len as u64)
                     .sum();
 
                 std::thread::scope(|s| {
@@ -2227,19 +2508,35 @@ where
                                 break;
                             }
                             let cid = &missing_on_relay[idx];
-                            let plain = &chunk_payloads[cid];
-                            match encrypt_chunk(vault_key, user_id, cid, plain)
-                                .and_then(|ct| {
-                                    let ct_len = ct.len() as u64;
-                                    client.put_chunk(cid, ct)?;
-                                    Ok(ct_len)
-                                }) {
+                            let (ref path, offset, len) = chunk_locations[cid];
+                            let plain = match retry_on_lock(|| read_chunk_from_file(path, offset, len)) {
+                                Ok(p) => p,
+                                Err(e) if is_file_lock_error(&e) => {
+                                    if let Ok(mut lc) = locked_cids.lock() {
+                                        lc.push(cid.clone());
+                                    }
+                                    continue;
+                                }
+                                Err(e) => {
+                                    if let Ok(mut err) = first_err.lock() {
+                                        if err.is_none() {
+                                            *err = Some(e.into());
+                                        }
+                                    }
+                                    continue;
+                                }
+                            };
+                            match encrypt_chunk(vault_key, user_id, cid, &plain).and_then(|ct| {
+                                let ct_len = ct.len() as u64;
+                                client.put_chunk(cid, ct)?;
+                                Ok(ct_len)
+                            }) {
                                 Ok(ct_len) => {
                                     if let Some(counter) = upload_counter {
                                         counter.fetch_add(ct_len, Ordering::Relaxed);
                                     }
-                                    let done = done_up.fetch_add(plain.len() as u64, Ordering::Relaxed)
-                                        + plain.len() as u64;
+                                    let done = done_up.fetch_add(len as u64, Ordering::Relaxed)
+                                        + len as u64;
                                     on_progress("Uploading chunks...", done, upload_total);
                                 }
                                 Err(e) => {
@@ -2258,8 +2555,32 @@ where
                     return Err(err);
                 }
             }
-            total_uploaded_files += to_upload.len();
+
+            let locked_cid_list = locked_cids.into_inner().unwrap_or_default();
+            let mut failed_rels: HashSet<String> = HashSet::new();
+            for cid in locked_cid_list {
+                if let Some(rels) = cid_to_rels.get(&cid) {
+                    for rel in rels {
+                        failed_rels.insert(rel.clone());
+                    }
+                }
+            }
+            for rel in &failed_rels {
+                skipped_locked.insert(rel.clone());
+                if let Some(r) = remote_map.get(rel) {
+                    merged_files.insert(rel.clone(), r.clone());
+                } else {
+                    merged_files.remove(rel);
+                }
+            }
+            let uploaded_ok = staged_uploads
+                .iter()
+                .filter(|r| !failed_rels.contains(*r))
+                .count();
+            total_uploaded_files += uploaded_ok;
         }
+
+        total_skipped_locked += skipped_locked.len();
 
         // Push updated manifest if anything changed locally.
         let owner_device_id = remote_manifest
@@ -2300,7 +2621,7 @@ where
         let mut active_count = 0usize;
         let mut active_bytes = 0u64;
         for (rel, entry) in &merged_files {
-            if incomplete_files.contains(rel) {
+            if incomplete_files.contains(rel) || skipped_locked.contains(rel) {
                 continue;
             }
             if !entry.deleted {
@@ -2318,10 +2639,29 @@ where
                 },
             );
         }
-        db.replace_baseline(&binding.share_id, &new_baseline)?;
-        if missing_chunks.is_empty() {
-            db.set_synced_version(&binding.share_id, final_version, now_ms())?;
+        for rel in &skipped_locked {
+            if let Some(old) = baseline.get(rel) {
+                new_baseline.insert(rel.clone(), old.clone());
+            }
         }
+        let now = now_ms();
+        db.replace_baseline(&binding.share_id, &new_baseline)?;
+        let saved_version = if missing_chunks.is_empty() {
+            db.set_synced_version(&binding.share_id, final_version, now)?;
+            final_version
+        } else {
+            synced_version
+        };
+        let _ = ensure_share_marker(&binding.local_path, &binding.share_id);
+        let _ = save_in_folder_baseline(
+            &binding.local_path,
+            &SharedBaselineFile {
+                share_id: binding.share_id.clone(),
+                synced_version: saved_version,
+                last_sync_ms: now,
+                entries: new_baseline,
+            },
+        );
 
         return Ok(ShareSyncOutcome {
             version: final_version,
@@ -2331,6 +2671,7 @@ where
             downloaded_files: total_downloaded_files,
             conflicts_created: total_conflicts,
             missing_chunks: missing_chunks.len(),
+            skipped_locked: total_skipped_locked,
         });
     }
 
@@ -2601,5 +2942,174 @@ mod tests {
             fs::read_to_string(&conflicts[0].conflict_path).unwrap(),
             "laptop-edit-v2"
         );
+    }
+
+    #[test]
+    fn unmounted_drive_guard_aborts_without_pushing_tombstones() {
+        let (_rt, url, _relay_dir) = start_test_relay();
+        let auth = RelayClient::new(&url, "", None)
+            .login_zero_knowledge("admin", "test-password-123", "pc-1", "PC1")
+            .unwrap()
+            .0;
+        let client = RelayClient::new(&url, &auth.token, None);
+
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("MountDrive");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("important.txt"), "keep me safe").unwrap();
+
+        let mut binding = LocalShareBinding {
+            share_id: "mount-guard-1".to_string(),
+            name: "MountDrive".to_string(),
+            local_path: folder.clone(),
+            ignore_patterns: Vec::new(),
+            paused: false,
+        };
+        let mut db = LocalStateDb::open(&root.path().join("state.db")).unwrap();
+        let noop = |_: &str, _: u64, _: u64| {};
+
+        let out = sync_share_once(
+            &client,
+            &mut db,
+            &auth.vault_key,
+            &auth.user_id,
+            "pc-1",
+            &mut binding,
+            None,
+            None,
+            &noop,
+        )
+        .unwrap();
+        assert_eq!(out.version, 1);
+        assert!(folder.join(SHARE_MARKER_FILE).is_file());
+
+        // Simulate unmounted drive: remove marker and/or folder.
+        fs::remove_dir_all(&folder).unwrap();
+
+        let err = sync_share_once(
+            &client,
+            &mut db,
+            &auth.vault_key,
+            &auth.user_id,
+            "pc-1",
+            &mut binding,
+            None,
+            None,
+            &noop,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Folder missing or drive unmounted"),
+            "unexpected error: {err}"
+        );
+        assert!(!folder.exists(), "guard must not recreate unmounted dir");
+
+        // Verify remote manifest still at v1 with important.txt intact.
+        let rec = client.get_share("mount-guard-1").unwrap().unwrap();
+        assert_eq!(rec.version, 1);
+        let manifest =
+            decrypt_manifest(&auth.vault_key, &auth.user_id, "mount-guard-1", &rec.encrypted_manifest_b64)
+                .unwrap();
+        assert!(manifest.files.iter().any(|f| f.rel_path == "important.txt" && !f.deleted));
+    }
+
+    #[test]
+    fn streaming_chunk_file_matches_in_memory_chunker() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("large.bin");
+        // 10 MiB (> STREAM_BUF_CAP of 8 MiB) with deterministic pseudo-random bytes.
+        let total = 10 * 1024 * 1024usize;
+        let mut data = vec![0u8; total];
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        for chunk in data.chunks_mut(8) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let bytes = state.to_le_bytes();
+            let n = chunk.len().min(8);
+            chunk[..n].copy_from_slice(&bytes[..n]);
+        }
+        fs::write(&file_path, &data).unwrap();
+
+        let vault_key = [7u8; 32];
+        let streamed = stream_chunk_file(&file_path, &vault_key).unwrap();
+        let expected_hash = blake3::hash(&data).to_hex().to_string();
+        assert_eq!(streamed.size, total as u64);
+        assert_eq!(streamed.blake3_hash, expected_hash);
+
+        let expected_slices = chunk_bytes(&data);
+        assert_eq!(streamed.chunks.len(), expected_slices.len());
+        let mut offset = 0u64;
+        for (sc, slice) in streamed.chunks.iter().zip(expected_slices.iter()) {
+            assert_eq!(sc.offset, offset);
+            assert_eq!(sc.len, slice.len());
+            assert_eq!(sc.chunk_ref.raw_size, slice.len() as u64);
+            assert_eq!(sc.chunk_ref.chunk_id, compute_chunk_id(&vault_key, slice));
+            offset += slice.len() as u64;
+        }
+    }
+
+    #[test]
+    fn shared_in_folder_baseline_prevents_dual_boot_false_conflict() {
+        let (_rt, url, _relay_dir) = start_test_relay();
+        let win_auth = RelayClient::new(&url, "", None)
+            .login_zero_knowledge("admin", "test-password-123", "win-pc", "Windows")
+            .unwrap()
+            .0;
+        let win_client = RelayClient::new(&url, &win_auth.token, None);
+        let lin_auth = RelayClient::new(&url, "", None)
+            .login_zero_knowledge("admin", "test-password-123", "lin-pc", "Linux")
+            .unwrap()
+            .0;
+        let lin_client = RelayClient::new(&url, &lin_auth.token, None);
+        let lap_auth = RelayClient::new(&url, "", None)
+            .login_zero_knowledge("admin", "test-password-123", "lap-pc", "Laptop")
+            .unwrap()
+            .0;
+        let lap_client = RelayClient::new(&url, &lap_auth.token, None);
+
+        let shared_part = tempfile::tempdir().unwrap();
+        let shared_dir = shared_part.path().join("Project");
+        let lap_dir = tempfile::tempdir().unwrap().path().join("Project");
+        fs::create_dir_all(&shared_dir).unwrap();
+        fs::write(shared_dir.join("doc.txt"), "v1").unwrap();
+
+        let mut win_bind = LocalShareBinding {
+            share_id: "dualboot-1".to_string(),
+            name: "Project".to_string(),
+            local_path: shared_dir.clone(),
+            ignore_patterns: Vec::new(),
+            paused: false,
+        };
+        let mut lin_bind = win_bind.clone();
+        let mut lap_bind = LocalShareBinding {
+            share_id: "dualboot-1".to_string(),
+            name: "Project".to_string(),
+            local_path: lap_dir.clone(),
+            ignore_patterns: Vec::new(),
+            paused: false,
+        };
+
+        let mut db_win = LocalStateDb::open(&shared_part.path().join("win.db")).unwrap();
+        let mut db_lin = LocalStateDb::open(&shared_part.path().join("lin.db")).unwrap();
+        let mut db_lap = LocalStateDb::open(&tempfile::tempdir().unwrap().path().join("lap.db")).unwrap();
+        let noop = |_: &str, _: u64, _: u64| {};
+
+        // 1. Windows syncs v1, Laptop pulls v1.
+        sync_share_once(&win_client, &mut db_win, &win_auth.vault_key, &win_auth.user_id, "win-pc", &mut win_bind, None, None, &noop).unwrap();
+        sync_share_once(&lap_client, &mut db_lap, &lap_auth.vault_key, &lap_auth.user_id, "lap-pc", &mut lap_bind, None, None, &noop).unwrap();
+
+        // 2. Reboot to Linux on same shared partition, edit doc.txt -> v2.
+        fs::write(shared_dir.join("doc.txt"), "v2-from-linux").unwrap();
+        sync_share_once(&lin_client, &mut db_lin, &lin_auth.vault_key, &lin_auth.user_id, "lin-pc", &mut lin_bind, None, None, &noop).unwrap();
+
+        // 3. Laptop pulls v2 and edits doc.txt -> v3.
+        sync_share_once(&lap_client, &mut db_lap, &lap_auth.vault_key, &lap_auth.user_id, "lap-pc", &mut lap_bind, None, None, &noop).unwrap();
+        fs::write(lap_dir.join("doc.txt"), "v3-from-laptop").unwrap();
+        sync_share_once(&lap_client, &mut db_lap, &lap_auth.vault_key, &lap_auth.user_id, "lap-pc", &mut lap_bind, None, None, &noop).unwrap();
+
+        // 4. Reboot back to Windows (db_win still at v1, but .deltadrop-baseline.json is at v2) -> no false conflict!
+        let out_win = sync_share_once(&win_client, &mut db_win, &win_auth.vault_key, &win_auth.user_id, "win-pc", &mut win_bind, None, None, &noop).unwrap();
+        assert_eq!(out_win.conflicts_created, 0);
+        assert_eq!(out_win.downloaded_files, 1);
+        assert_eq!(fs::read_to_string(shared_dir.join("doc.txt")).unwrap(), "v3-from-laptop");
     }
 }
