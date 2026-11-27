@@ -166,9 +166,8 @@ if [[ -z "$ADMIN_PASS" ]]; then
   exit 1
 fi
 
-GENERATED_GATE="$(openssl rand -hex 24)"
 echo ""
-RELAY_NETWORK_SECRET="$(prompt_default "Optional RELAY_NETWORK_SECRET (X-DeltaDrop-Gate, blank to disable)" "$GENERATED_GATE")"
+RELAY_NETWORK_SECRET="$(prompt_default "Optional RELAY_NETWORK_SECRET (leave blank to disable)" "")"
 
 echo ""
 echo "Select ingress mode:"
@@ -378,9 +377,29 @@ elif [[ "$INGRESS_MODE" == "3" ]]; then
   "
   RELAY_URL="https://${CF_PUBLIC_HOST:-<your-tunnel-domain>}"
 else
-  LXC_IP="$(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
-  LXC_IP="${LXC_IP:-<LXC_IP>}"
-  RELAY_URL="http://${LXC_IP}:${RELAY_PORT}"
+  echo "Enabling /dev/net/tun and installing Tailscale inside LXC ${CTID}..."
+  if ! grep -q "/dev/net/tun" "/etc/pve/lxc/${CTID}.conf"; then
+    cat >> "/etc/pve/lxc/${CTID}.conf" <<'TUNEOF'
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+TUNEOF
+    pct reboot "$CTID"
+    for _ in $(seq 1 30); do
+      if pct exec "$CTID" -- test -c /dev/net/tun 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+  pct exec "$CTID" -- bash -c "curl -fsSL https://tailscale.com/install.sh | sh"
+  pct exec "$CTID" -- tailscale up
+  TS_IP="$(pct exec "$CTID" -- tailscale ip -4 2>/dev/null | head -n1 || true)"
+  if [[ -n "$TS_IP" ]]; then
+    RELAY_URL="http://${TS_IP}:${RELAY_PORT}"
+  else
+    LXC_IP="$(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
+    RELAY_URL="http://${LXC_IP:-<LXC_IP>}:${RELAY_PORT}"
+  fi
 fi
 
 [[ -n "${DOWNLOADED_TMP:-}" ]] && rm -f "$DOWNLOADED_TMP"
