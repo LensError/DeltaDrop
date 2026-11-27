@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -27,6 +26,7 @@ pub struct SharedBaselineFile {
 pub fn write_hidden_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        use std::io::Write;
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
         if let Ok(mut f) = std::fs::OpenOptions::new()
