@@ -2,13 +2,12 @@ use std::path::Path;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-use crate::config::{IgnoreRule, SyncFolderConfig, SyncMode};
-
-// Internal sync-safety patterns so DeltaDrop never syncs its own atomic staging or conflict backups.
+// Internal safety patterns so DeltaDrop never syncs temp staging files or conflict backups.
 const INTERNAL_SAFETY_PATTERNS: &[&str] = &[
     ".deltadrop-tmp*",
-    "*.deltadrop-tmp",
+    "*.deltadrop-tmp*",
     "*.sync-conflict-*",
+    ".deltadropignore",
     ".deltadropignore.tmp",
 ];
 
@@ -87,90 +86,67 @@ pub const IGNORE_PRESETS: &[IgnorePreset] = &[
 ];
 
 pub struct IgnoreFilter {
+    root: std::path::PathBuf,
     matcher: Gitignore,
 }
 
 impl IgnoreFilter {
-    pub fn for_folder_config(folder: &SyncFolderConfig) -> Self {
-        let mut builder = GitignoreBuilder::new(&folder.path);
+    pub fn from_patterns(root: &Path, patterns: &[String]) -> Self {
+        let mut builder = GitignoreBuilder::new(root);
         for pat in INTERNAL_SAFETY_PATTERNS {
             let _ = builder.add_line(None, pat);
         }
-        for rule in &folder.ignore_rules {
-            if rule.enabled {
-                let trimmed = rule.pattern.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    let _ = builder.add_line(None, trimmed);
-                }
-            }
-        }
-        for line in folder.custom_ignore.lines() {
-            let trimmed = line.trim();
+        for pat in patterns {
+            let trimmed = pat.trim();
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
                 let _ = builder.add_line(None, trimmed);
             }
         }
-        let ignore_file = folder.path.join(".deltadropignore");
+        let ignore_file = root.join(".deltadropignore");
         if ignore_file.is_file() {
             let _ = builder.add(ignore_file);
         }
         let matcher = builder.build().unwrap_or_else(|_| Gitignore::empty());
-        Self { matcher }
+        Self {
+            root: root.to_path_buf(),
+            matcher,
+        }
     }
 
-    /// Returns true if the relative path (forward-slash normalized) should be synced.
-    pub fn should_sync(&self, folder: &SyncFolderConfig, rel_path: &str, is_dir: bool) -> bool {
-        if folder.mode == SyncMode::Whitelist {
-            let Some(top_dir) = rel_path.split('/').next() else {
-                return false;
-            };
-            if !is_dir && !rel_path.contains('/') {
-                return false;
-            }
-            if !folder.whitelist_subdirs.iter().any(|s| s == top_dir) {
-                return false;
-            }
-        }
-
-        let check_path = folder.path.join(rel_path);
+    pub fn should_sync(&self, rel_path: &str, is_dir: bool) -> bool {
+        let check_path = self.root.join(rel_path);
         !self
             .matcher
             .matched_path_or_any_parents(&check_path, is_dir)
             .is_ignore()
     }
 
-    /// Live preview helper for the UI "Test Path" input.
-    /// Returns `true` if `sample_rel_path` would be ignored, `false` if it would be synced.
-    pub fn test_path_ignored(&self, folder: &SyncFolderConfig, sample_rel_path: &str) -> bool {
+    pub fn test_path_ignored(&self, sample_rel_path: &str) -> bool {
         let normalized = sample_rel_path.trim().replace('\\', "/");
         let is_dir = normalized.ends_with('/');
         let rel = normalized.trim_matches('/');
         if rel.is_empty() {
             return false;
         }
-        !self.should_sync(folder, rel, is_dir)
+        !self.should_sync(rel, is_dir)
     }
 }
 
-/// Auto-detects project markers in `dir` and returns matching enabled ignore rules.
-pub fn detect_project_ignore_rules(dir: &Path) -> Vec<IgnoreRule> {
-    let mut rules = Vec::new();
+/// Auto-detects project markers in `dir` and returns matching ignore patterns.
+pub fn detect_project_ignore_patterns(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
     let mut push_preset = |name: &str| {
         if let Some(preset) = IGNORE_PRESETS.iter().find(|p| p.name == name) {
             for &pat in preset.patterns {
-                if !rules.iter().any(|r: &IgnoreRule| r.pattern == pat) {
-                    rules.push(IgnoreRule {
-                        pattern: pat.to_string(),
-                        enabled: true,
-                    });
+                if !out.iter().any(|p: &String| p == pat) {
+                    out.push(pat.to_string());
                 }
             }
         }
     };
 
-    if dir.join(".git").exists() {
-        push_preset("Git / OS Junk");
-    }
+    // Always include OS junk on any folder; add .git if present
+    push_preset("Git / OS Junk");
     if dir.join("Cargo.toml").is_file() {
         push_preset("Rust");
     }
@@ -190,37 +166,45 @@ pub fn detect_project_ignore_rules(dir: &Path) -> Vec<IgnoreRule> {
     if dir.join("CMakeLists.txt").is_file() || dir.join(".vs").is_dir() {
         push_preset("C / C++ / IDE");
     }
-    rules
+    out
 }
 
-/// Writes `.deltadropignore` in `folder.path` as the single synced source of truth.
-pub fn write_ignore_file_from_folder(folder: &SyncFolderConfig) -> std::io::Result<()> {
-    if !folder.path.is_dir() {
-        return Ok(());
-    }
-    let mut lines = Vec::new();
-    for r in &folder.ignore_rules {
-        if r.enabled {
-            let p = r.pattern.trim();
-            if !p.is_empty() {
-                lines.push(p.to_string());
+pub fn preset_is_enabled(patterns: &[String], preset: &IgnorePreset) -> bool {
+    preset
+        .patterns
+        .iter()
+        .any(|pat| patterns.iter().any(|p| p == pat))
+}
+
+pub fn toggle_preset_patterns(patterns: &mut Vec<String>, preset: &IgnorePreset, enable: bool) {
+    if enable {
+        for &pat in preset.patterns {
+            if !patterns.iter().any(|p| p == pat) {
+                patterns.push(pat.to_string());
             }
         }
+    } else {
+        patterns.retain(|p| !preset.patterns.contains(&p.as_str()));
     }
-    for line in folder.custom_ignore.lines() {
-        let p = line.trim();
-        if !p.is_empty() && !lines.iter().any(|x| x == p) {
-            lines.push(p.to_string());
-        }
+}
+
+pub fn write_ignore_file(root: &Path, patterns: &[String]) -> std::io::Result<()> {
+    if !root.is_dir() {
+        return Ok(());
     }
-    let ignore_path = folder.path.join(".deltadropignore");
-    if lines.is_empty() {
+    let ignore_path = root.join(".deltadropignore");
+    let clean: Vec<&str> = patterns
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean.is_empty() {
         if ignore_path.is_file() {
             let _ = std::fs::remove_file(&ignore_path);
         }
         return Ok(());
     }
-    let mut body = lines.join("\n");
+    let mut body = clean.join("\n");
     body.push('\n');
     std::fs::write(&ignore_path, body)
 }
@@ -228,77 +212,21 @@ pub fn write_ignore_file_from_folder(folder: &SyncFolderConfig) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IgnoreRule;
 
     #[test]
-    fn respects_user_rules_toggles_custom_text_and_whitelist() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(".deltadropignore"), "secret/\n").unwrap();
+    fn detects_unity_and_rust_and_filters_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Assets")).unwrap();
+        std::fs::create_dir_all(dir.path().join("ProjectSettings")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
 
-        let full_folder = SyncFolderConfig {
-            id: "code".into(),
-            label: None,
-            path: root.path().to_path_buf(),
-            mode: SyncMode::Full,
-            whitelist_subdirs: vec![],
-            ignore_rules: vec![
-                IgnoreRule {
-                    pattern: "target/".into(),
-                    enabled: true,
-                },
-                IgnoreRule {
-                    pattern: "node_modules/".into(),
-                    enabled: false,
-                },
-            ],
-            custom_ignore: "*.log\n".into(),
-        };
-        let filter = IgnoreFilter::for_folder_config(&full_folder);
-
-        assert!(filter.should_sync(&full_folder, "src/main.rs", false));
-        assert!(!filter.should_sync(&full_folder, "target/debug/app", false));
-        // Disabled rule does not ignore node_modules/
-        assert!(filter.should_sync(&full_folder, "node_modules/pkg/index.js", false));
-        assert!(!filter.should_sync(&full_folder, "app.log", false));
-        assert!(!filter.should_sync(&full_folder, "secret/key.txt", false));
-        assert!(!filter.should_sync(&full_folder, "foo.sync-conflict-123.rs", false));
-
-        let wl_folder = SyncFolderConfig {
-            id: "projects".into(),
-            label: None,
-            path: root.path().to_path_buf(),
-            mode: SyncMode::Whitelist,
-            whitelist_subdirs: vec!["Alpha".into()],
-            ignore_rules: vec![IgnoreRule {
-                pattern: "Library/".into(),
-                enabled: true,
-            }],
-            custom_ignore: String::new(),
-        };
-        let wl_filter = IgnoreFilter::for_folder_config(&wl_folder);
-        assert!(wl_filter.should_sync(&wl_folder, "Alpha/Assets/Player.cs", false));
-        assert!(!wl_filter.should_sync(&wl_folder, "Alpha/Library/cache.db", false));
-        assert!(!wl_filter.should_sync(&wl_folder, "Beta/Assets/Player.cs", false));
-        assert!(!wl_filter.should_sync(&wl_folder, "root_file.txt", false));
-    }
-
-    #[test]
-    fn supports_negation_and_live_test_path_preview() {
-        let root = tempfile::tempdir().unwrap();
-        let folder = SyncFolderConfig {
-            id: "web".into(),
-            label: None,
-            path: root.path().to_path_buf(),
-            mode: SyncMode::Full,
-            whitelist_subdirs: vec![],
-            ignore_rules: vec![],
-            custom_ignore: "*.log\n!important.log\ndist/\n".into(),
-        };
-        let filter = IgnoreFilter::for_folder_config(&folder);
-        assert!(filter.test_path_ignored(&folder, "debug.log"));
-        assert!(!filter.test_path_ignored(&folder, "important.log"));
-        assert!(filter.test_path_ignored(&folder, "dist/bundle.js"));
-        assert!(filter.test_path_ignored(&folder, ".deltadropignore.tmp"));
-        assert!(!filter.test_path_ignored(&folder, "src/index.ts"));
+        let pats = detect_project_ignore_patterns(dir.path());
+        let filter = IgnoreFilter::from_patterns(dir.path(), &pats);
+        assert!(!filter.should_sync("Library/ArtifactDB", false));
+        assert!(!filter.should_sync("target/debug/app.exe", false));
+        assert!(!filter.should_sync(".git/HEAD", false));
+        assert!(!filter.should_sync("foo.sync-conflict-pc-123.cs", false));
+        assert!(filter.should_sync("Assets/Scripts/Player.cs", false));
+        assert!(filter.should_sync("src/main.rs", false));
     }
 }

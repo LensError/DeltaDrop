@@ -6,11 +6,12 @@ Fast, end-to-end encrypted file sync across Windows, Linux, and macOS using a li
 
 - **Zero-knowledge account login:** Sign in with Relay Address + Username + Password (or `user@relay` shorthand). Argon2id derives `auth_key` and `vault_key` locally; `vault_key` never leaves your device.
 - **Multi-user admin & isolated workspaces:** Admins can create, reset, disable, or delete sub-users; each user has an isolated encrypted chunk workspace.
-- **Demand-driven ephemeral relay cache:** Publishing a folder uploads only lightweight encrypted manifests. Chunks stream on demand over WebSocket + HTTP (<= 16 MiB) and are evicted immediately on `ACK`, or by `CHUNK_TTL_HOURS` / `MAX_CACHE_GB` LRU.
+- **Two-way async relay cache:** Publishing or editing a folder uploads deduplicated, encrypted FastCDC chunks to the relay cache so another PC (such as a laptop) can pull changes hours later even while the first PC is asleep or offline. Chunks are evicted automatically by `CHUNK_TTL_HOURS` / `MAX_CACHE_GB` LRU and re-seeded on demand if ever evicted.
+- **Safe folder assignment:** Assigning a remote share to a parent folder (like `Desktop`) always creates a dedicated `<Parent>/<ShareName>` subfolder and refuses raw OS roots, preventing loose files from ever being dumped onto your Desktop.
 - **Real E2E encryption:** File contents, filenames, folder names, and device names are encrypted client-side with ChaCha20-Poly1305 before leaving your device.
-- **Large-file streaming & delta sync:** Files over 256 KiB are split into content-addressed FastCDC chunks and deduplicated.
-- **Two-way sync & conflict protection:** All folders use two-way sync with `.sync-conflict-*` backups, stale-host reconciliation, and non-destructive re-linking after OS reinstalls.
-- **Auto-detected ignore presets:** Built-in toggles for Unity, Rust, Node/Web, Python, C/C++/IDE, and Git/OS Junk plus `.deltadropignore` sync and live path testing.
+- **FastCDC delta sync:** Large files are split into content-addressed FastCDC chunks and deduplicated before upload.
+- **Two-way 3-way merge & conflict protection:** Concurrent offline edits are detected via local baseline tracking and preserve your local copy as `*.sync-conflict-*` backups before applying remote changes.
+- **Auto-detected ignore presets:** Built-in toggles for Unity (`Library/`, `Temp/`, `Logs/`), Rust (`target/`), Node/Web (`node_modules/`), Python, C/C++/IDE, and Git/OS Junk synced across all devices via the encrypted manifest, plus live path testing.
 - **SHA-256 verified updates:** Both `deltadrop-client` (in-app updater) and `deltadrop-relay` (`deltadrop-update`) verify release `SHA256SUMS` before replacing binaries.
 
 ---
@@ -60,7 +61,7 @@ TLS_DOMAIN="relay.example.com" docker compose --profile tls up -d
 1. Download the latest release for your OS from [GitHub Releases](https://github.com/LensError/DeltaDrop/releases/latest):
    - **Windows:** `deltadrop-client-windows-x86_64.zip`
    - **Linux:** `deltadrop-client-linux-x86_64.tar.gz`
-   - **macOS:** `deltadrop-client-macos-universal.tar.gz`
+   - **macOS:** `deltadrop-client-macos-arm64.tar.gz`
 2. Launch `deltadrop-client`.
 3. Sign in with your **Relay Address**, **Username** (or paste `username@relay-host` to auto-fill both), **Password**, and **Device Name**.
 4. Choose **Share a Local Folder** or **Sync from Another PC** to start two-way syncing.

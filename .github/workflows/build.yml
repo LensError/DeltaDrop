@@ -67,7 +67,7 @@ jobs:
             target: windows-x86_64
             ext: zip
           - os: macos-latest
-            target: macos-universal
+            target: macos-arm64
             ext: tar.gz
     runs-on: ${{ matrix.os }}
     steps:

@@ -1,12 +1,17 @@
+use std::path::PathBuf;
+
 use deltadrop_common::format_bytes;
 use lumenic::{App, UiContext};
 
-use crate::sync::{SyncCommand, SyncHandle, UiSnapshot};
-use crate::ui::theme::Palette;
-use crate::ui::topology::render_topology_canvas;
-use crate::ui::UiState;
+use crate::config::{is_dangerous_root_path, validate_share_path, LocalShareBinding};
+use crate::ignore_rules::{
+    preset_is_enabled, toggle_preset_patterns, IgnoreFilter, IGNORE_PRESETS,
+};
+use crate::sync::{ShareSyncState, SyncCommand, SyncHandle, UiSnapshot};
+use crate::ui::theme::{open_folder_in_os, Palette};
+use crate::ui::{AssignModalState, IgnoreEditorState, UiState};
 
-pub fn render_overview(
+pub fn render_folders_view(
     ui: &mut UiContext,
     app: &App,
     snap: &UiSnapshot,
@@ -15,230 +20,671 @@ pub fn render_overview(
 ) {
     let p = Palette::default();
 
-    // Top 60%: Dynamic Shader Topology Canvas
-    render_topology_canvas(ui, snap, &mut state.topology, &mut |folder_id, _peer_id| {
-        let dialog = app.pick_folder(&format!("Sync '{folder_id}' to folder"));
-        state.map_remote_picker = Some((folder_id.to_string(), dialog));
-    });
+    // Compact live telemetry strip
+    render_telemetry_strip(ui, snap, &p);
 
-    ui.divider().bg(p.border);
+    // Inline Assign Remote Share Confirmation Panel
+    if let Some(mut modal) = state.assign_modal.take() {
+        let mut keep_open = true;
+        let target_path = PathBuf::from(modal.target_path.text().trim());
+        let existing_bindings: Vec<LocalShareBinding> = snap
+            .shares
+            .iter()
+            .map(|s| LocalShareBinding {
+                share_id: s.share_id.clone(),
+                name: s.name.clone(),
+                local_path: s.local_path.clone(),
+                ignore_patterns: s.ignore_patterns.clone(),
+                paused: s.paused,
+            })
+            .collect();
+        let path_validation =
+            validate_share_path(&target_path, &existing_bindings, Some(&modal.share_id));
 
-    // Bottom 40%: 4-Column Open Telemetry Row (no bordered cards, mono numbers)
-    let relay_val = if snap.online {
-        let ms = snap.relay_latency_ms.unwrap_or(0);
-        let tls = if snap
-            .active_config
-            .as_ref()
-            .is_some_and(|c| c.relay_url.starts_with("https://"))
-        {
-            "TLS"
-        } else {
-            "HTTP"
-        };
-        if ms > 0 {
-            format!("{ms} ms  ·  {tls}")
-        } else {
-            format!("Connected  ·  {tls}")
-        }
-    } else {
-        "Offline".to_string()
-    };
-
-    let throughput_val = format!(
-        "↑ {}/s   ↓ {}/s",
-        format_bytes(snap.upload_bps),
-        format_bytes(snap.download_bps)
-    );
-
-    let folder_count = snap
-        .active_config
-        .as_ref()
-        .map(|c| c.folders.len())
-        .unwrap_or(0);
-    let workspace_val = format!("{folder_count} folders");
-
-    let cache_used = format_bytes(snap.cache_status.used_bytes);
-    let cache_max = if snap.cache_status.max_bytes > 0 {
-        format_bytes(snap.cache_status.max_bytes)
-    } else {
-        format_bytes(snap.relay_status.max_bytes)
-    };
-    let cache_val = format!("{cache_used} / {cache_max}");
-
-    ui.row(|ui| {
-        telemetry_col(
-            ui,
-            "RELAY",
-            &relay_val,
-            if snap.online {
-                p.ok_green
-            } else {
-                p.warn_amber
-            },
-            &p,
-        );
-        telemetry_col(ui, "THROUGHPUT", &throughput_val, p.text, &p);
-        telemetry_col(ui, "WORKSPACE", &workspace_val, p.text, &p);
-        telemetry_col(ui, "TRANSIT CACHE", &cache_val, p.text, &p);
-    })
-    .w_frac(1.0)
-    .px(24.0)
-    .py(20.0)
-    .gap(24.0)
-    .justify_between();
-
-    ui.divider().bg(p.border);
-
-    // Single-Line Contextual Activity / Conflict Bar
-    ui.col(|ui| {
-        if !snap.conflicts.is_empty() {
+        ui.col(|ui| {
             ui.row(|ui| {
-                ui.txt(&format!(
-                    "{} conflict(s) require resolution",
-                    snap.conflicts.len()
-                ))
-                .sz(12.5)
-                .fg(p.warn_amber);
-
+                ui.txt(&format!("Assign Remote Share: {}", modal.share_name))
+                    .sz(14.0)
+                    .bold()
+                    .fg(p.accent);
                 if ui
-                    .btn("Review")
-                    .bg(p.surface)
-                    .bd(1.0, p.warn_amber)
-                    .fg(p.warn_amber)
-                    .sz(12.0)
+                    .btn("Cancel")
+                    .sz(11.5)
                     .px(10.0)
                     .py(4.0)
+                    .bg(p.surface_alt)
+                    .bd(1.0, p.border)
+                    .fg(p.muted)
                     .clicked()
                 {
-                    state.show_conflict_modal = true;
+                    keep_open = false;
                 }
             })
             .w_frac(1.0)
             .justify_between()
             .align_center();
-        } else if snap.pending_uploads > 0 || snap.pending_downloads > 0 {
-            let latest = snap
-                .activity
-                .first()
-                .map(|a| format!("{} — {}", a.rel_path, a.detail))
-                .unwrap_or_else(|| "Syncing changes...".to_string());
-            ui.row(|ui| {
-                ui.txt(&latest).sz(12.0).fg(p.text);
-                ui.txt(&format!(
-                    "↑ {}   ↓ {}",
-                    snap.pending_uploads, snap.pending_downloads
-                ))
-                .sz(12.0)
-                .mono()
-                .fg(p.ok_green);
-            })
-            .w_frac(1.0)
-            .justify_between();
+
+            ui.txt(&format!(
+                "{} files ({}) - Picking a parent folder like Desktop automatically creates a '{}' subfolder.",
+                modal.file_count,
+                format_bytes(modal.total_bytes),
+                modal.share_name
+            ))
+            .sz(12.0)
+            .fg(p.muted);
 
             ui.row(|ui| {
-                ui.col(|_| {}).w_frac(0.45).h(2.0).bg(p.ok_green);
+                ui.input("assign_target_path", &mut modal.target_path)
+                    .w_frac(1.0)
+                    .bg(p.bg)
+                    .bd(1.0, p.border)
+                    .px(10.0)
+                    .py(6.0);
+                if ui
+                    .btn("Browse...")
+                    .sz(12.0)
+                    .px(12.0)
+                    .py(6.0)
+                    .bg(p.surface_alt)
+                    .bd(1.0, p.border)
+                    .fg(p.text)
+                    .clicked()
+                {
+                    let dlg = app.pick_folder(&format!(
+                        "Choose parent folder for '{}'",
+                        modal.share_name
+                    ));
+                    state.assign_browse_picker = Some(dlg);
+                }
             })
             .w_frac(1.0)
-            .h(2.0)
-            .bg(p.border);
-        } else if let Some(ref err) = snap.last_error {
-            ui.txt(err).sz(12.0).fg(p.err_red);
-        } else {
-            let status_line = if snap.paused {
-                "Sync paused"
-            } else {
-                "All folders synchronized  ·  Up to date"
-            };
-            ui.txt(status_line).sz(12.0).fg(p.muted);
+            .gap(8.0)
+            .align_center();
+
+            match &path_validation {
+                Ok(()) => {
+                    ui.txt(&format!("Will sync into: {}", target_path.display()))
+                        .sz(12.0)
+                        .fg(p.ok_green);
+                }
+                Err(msg) => {
+                    ui.txt(msg).sz(12.0).fg(p.err_red);
+                }
+            }
+
+            ui.row(|ui| {
+                let can_start = path_validation.is_ok() && !is_dangerous_root_path(&target_path);
+                let btn = ui
+                    .btn("Start Sync")
+                    .sz(12.5)
+                    .px(14.0)
+                    .py(6.0)
+                    .bg(if can_start { p.ok_green } else { p.surface_alt })
+                    .fg(if can_start { p.bg } else { p.muted });
+                if can_start && btn.clicked() {
+                    sync.send(SyncCommand::AssignRemoteShare {
+                        share_id: modal.share_id.clone(),
+                        target_path,
+                    });
+                    keep_open = false;
+                }
+                if ui
+                    .btn("Ignore on This PC")
+                    .sz(12.0)
+                    .px(12.0)
+                    .py(6.0)
+                    .bg(p.surface_alt)
+                    .bd(1.0, p.border)
+                    .fg(p.muted)
+                    .clicked()
+                {
+                    sync.send(SyncCommand::IgnoreRemoteShare(modal.share_id.clone()));
+                    keep_open = false;
+                }
+            })
+            .gap(8.0);
+        })
+        .w_frac(1.0)
+        .p(14.0)
+        .gap(10.0)
+        .bg(p.surface)
+        .bd(1.5, p.accent)
+        .r(6.0);
+
+        if keep_open {
+            state.assign_modal = Some(modal);
+        }
+    }
+
+    // Banner: Unassigned Remote Shares
+    if !snap.unassigned_shares.is_empty() {
+        ui.col(|ui| {
+            ui.txt(&format!(
+                "Available Remote Shares ({})",
+                snap.unassigned_shares.len()
+            ))
+            .sz(13.0)
+            .bold()
+            .fg(p.accent);
+            ui.txt("Choose where to store these folders on this PC before syncing begins.")
+                .sz(11.5)
+                .fg(p.muted);
+
+            for preview in &snap.unassigned_shares {
+                ui.row(|ui| {
+                    ui.col(|ui| {
+                        ui.txt(&preview.name).sz(13.0).bold().fg(p.text);
+                        ui.txt(&format!(
+                            "v{} - {} files ({}) - Default: {}",
+                            preview.version,
+                            preview.file_count,
+                            format_bytes(preview.total_bytes),
+                            preview.suggested_path.display()
+                        ))
+                        .sz(11.5)
+                        .fg(p.muted);
+                    })
+                    .gap(2.0);
+
+                    ui.row(|ui| {
+                        if ui
+                            .btn("Assign Folder")
+                            .sz(12.0)
+                            .px(12.0)
+                            .py(5.0)
+                            .bg(p.accent)
+                            .fg(p.bg)
+                            .clicked()
+                        {
+                            state.assign_modal = Some(AssignModalState::from_preview(preview));
+                        }
+                        if ui
+                            .btn("Ignore")
+                            .sz(11.5)
+                            .px(10.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.border)
+                            .fg(p.muted)
+                            .clicked()
+                        {
+                            sync.send(SyncCommand::IgnoreRemoteShare(preview.share_id.clone()));
+                        }
+                    })
+                    .gap(6.0)
+                    .align_center();
+                })
+                .w_frac(1.0)
+                .p(10.0)
+                .bg(p.bg)
+                .bd(1.0, p.border)
+                .r(4.0)
+                .justify_between()
+                .align_center();
+            }
+        })
+        .w_frac(1.0)
+        .p(14.0)
+        .gap(8.0)
+        .bg(p.surface)
+        .bd(1.0, p.accent)
+        .r(6.0);
+    }
+
+    // Synced Folders Header
+    ui.row(|ui| {
+        ui.txt(&format!("Synced Folders ({})", snap.shares.len()))
+            .sz(14.0)
+            .bold()
+            .fg(p.text);
+        if ui
+            .btn("+ Add Local Folder")
+            .sz(12.0)
+            .px(12.0)
+            .py(6.0)
+            .bg(p.ok_green)
+            .fg(p.bg)
+            .clicked()
+        {
+            state.add_folder_picker = Some(app.pick_folder("Select a local project folder to sync"));
         }
     })
     .w_frac(1.0)
-    .px(24.0)
-    .py(14.0)
-    .gap(8.0);
+    .justify_between()
+    .align_center();
 
-    // Conflict Resolution Modal
-    if state.show_conflict_modal && !snap.conflicts.is_empty() {
-        let mut open = state.show_conflict_modal;
-        ui.modal("conflict-modal", &mut open, |ui| {
+    if snap.shares.is_empty() {
+        ui.col(|ui| {
+            ui.txt("No folders synced on this PC yet.")
+                .sz(13.0)
+                .bold()
+                .fg(p.text);
+            ui.txt("Click '+ Add Local Folder' to share a project from this PC, or assign an available remote share above.")
+                .sz(12.0)
+                .fg(p.muted);
+        })
+        .w_frac(1.0)
+        .p(20.0)
+        .gap(6.0)
+        .bg(p.surface)
+        .bd(1.0, p.border)
+        .r(6.0);
+    } else {
+        for share in &snap.shares {
+            let status_color = match &share.state {
+                ShareSyncState::Idle => p.ok_green,
+                ShareSyncState::Scanning | ShareSyncState::Syncing => p.accent,
+                ShareSyncState::WaitingForHost | ShareSyncState::Paused => p.warn_amber,
+                ShareSyncState::Error(_) => p.err_red,
+            };
+
             ui.col(|ui| {
-                ui.txt("CONFLICT RESOLUTION").sz(13.0).bold().fg(p.text);
-                ui.divider().bg(p.border);
-
-                for c in &snap.conflicts {
+                ui.row(|ui| {
                     ui.col(|ui| {
-                        ui.txt(&format!("[{}] {}", c.folder_id, c.rel_path))
-                            .sz(12.5)
-                            .fg(p.text);
-                        ui.txt(&format!("Backup: {} ({})", c.conflict_path, c.time_label))
-                            .sz(11.5)
-                            .mono()
-                            .fg(p.muted);
                         ui.row(|ui| {
-                            if ui.btn("Keep Local").sz(11.5).px(8.0).py(4.0).clicked() {
-                                let _ = sync.cmd_tx.send(SyncCommand::ResolveConflict {
-                                    id: c.id,
-                                    keep_conflict_file: false,
-                                    folder_id: c.folder_id.clone(),
-                                    rel_path: c.rel_path.clone(),
-                                    conflict_path: c.conflict_path.clone(),
-                                });
+                            ui.txt(&share.name).sz(13.5).bold().fg(p.text);
+                            ui.txt(&format!("v{}", share.version))
+                                .sz(11.0)
+                                .fg(p.muted)
+                                .bg(p.bg)
+                                .px(6.0)
+                                .py(2.0)
+                                .r(3.0);
+                            ui.txt(&share.status_detail).sz(11.5).fg(status_color);
+                        })
+                        .gap(8.0)
+                        .align_center();
+
+                        ui.txt(&format!(
+                            "{}  -  {} files ({})  -  {}",
+                            share.local_path.display(),
+                            share.file_count,
+                            format_bytes(share.total_bytes),
+                            share.last_sync_label
+                        ))
+                        .sz(11.5)
+                        .fg(p.muted);
+                    })
+                    .gap(3.0);
+
+                    ui.row(|ui| {
+                        if ui
+                            .btn("Sync Now")
+                            .sz(11.5)
+                            .px(10.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.ok_green)
+                            .fg(p.ok_green)
+                            .clicked()
+                        {
+                            sync.send(SyncCommand::SyncNow(Some(share.share_id.clone())));
+                        }
+                        if ui
+                            .btn("Ignore Rules")
+                            .sz(11.5)
+                            .px(9.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.border)
+                            .fg(p.text)
+                            .clicked()
+                        {
+                            let already_open = state
+                                .ignore_editor
+                                .as_ref()
+                                .is_some_and(|e| e.share_id == share.share_id);
+                            if already_open {
+                                state.ignore_editor = None;
+                            } else {
+                                state.ignore_editor = Some(IgnoreEditorState::new(
+                                    share.share_id.clone(),
+                                    share.local_path.clone(),
+                                    share.ignore_patterns.clone(),
+                                ));
                             }
+                        }
+                        if ui
+                            .btn("Open")
+                            .sz(11.5)
+                            .px(8.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.border)
+                            .fg(p.text)
+                            .clicked()
+                        {
+                            open_folder_in_os(&share.local_path);
+                        }
+                        if ui
+                            .btn(if share.paused { "Resume" } else { "Pause" })
+                            .sz(11.5)
+                            .px(8.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.border)
+                            .fg(p.muted)
+                            .clicked()
+                        {
+                            sync.send(SyncCommand::ToggleSharePause(share.share_id.clone()));
+                        }
+                        if ui
+                            .btn("Unlink")
+                            .sz(11.5)
+                            .px(8.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.border)
+                            .fg(p.muted)
+                            .clicked()
+                        {
+                            sync.send(SyncCommand::UnlinkLocalShare(share.share_id.clone()));
+                        }
+
+                        let confirming = state.confirm_delete_share.as_deref()
+                            == Some(share.share_id.as_str());
+                        if confirming {
                             if ui
-                                .btn("Keep Conflict Copy")
+                                .btn("Confirm Delete")
                                 .sz(11.5)
-                                .px(8.0)
-                                .py(4.0)
+                                .px(9.0)
+                                .py(5.0)
+                                .bg(p.err_red)
+                                .fg(p.text)
                                 .clicked()
                             {
-                                let _ = sync.cmd_tx.send(SyncCommand::ResolveConflict {
-                                    id: c.id,
-                                    keep_conflict_file: true,
-                                    folder_id: c.folder_id.clone(),
-                                    rel_path: c.rel_path.clone(),
-                                    conflict_path: c.conflict_path.clone(),
-                                });
+                                state.confirm_delete_share = None;
+                                sync.send(SyncCommand::DeleteRemoteShare(share.share_id.clone()));
                             }
-                            if ui.btn("Dismiss").sz(11.5).px(8.0).py(4.0).clicked() {
-                                let _ = sync.cmd_tx.send(SyncCommand::DismissConflict(c.id));
-                            }
-                        })
-                        .gap(8.0);
+                        } else if ui
+                            .btn("Delete")
+                            .sz(11.5)
+                            .px(8.0)
+                            .py(5.0)
+                            .bg(p.surface_alt)
+                            .bd(1.0, p.err_red)
+                            .fg(p.err_red)
+                            .clicked()
+                        {
+                            state.confirm_delete_share = Some(share.share_id.clone());
+                        }
                     })
-                    .w_frac(1.0)
-                    .py(8.0)
-                    .gap(6.0);
-                    ui.divider().bg(p.border);
+                    .gap(5.0)
+                    .align_center();
+                })
+                .w_frac(1.0)
+                .justify_between()
+                .align_center();
+
+                if share.transfer_total_bytes > 0 {
+                    let frac = (share.transferred_bytes as f32
+                        / share.transfer_total_bytes as f32)
+                        .clamp(0.0, 1.0);
+                    ui.txt(&format!(
+                        "{} / {} ({:.0}%)",
+                        format_bytes(share.transferred_bytes),
+                        format_bytes(share.transfer_total_bytes),
+                        frac * 100.0
+                    ))
+                    .sz(11.0)
+                    .fg(p.accent);
                 }
 
-                if ui.btn("Close").sz(12.0).px(10.0).py(5.0).clicked() {
-                    state.show_conflict_modal = false;
+                // Inline Ignore Rules Editor
+                if state
+                    .ignore_editor
+                    .as_ref()
+                    .is_some_and(|e| e.share_id == share.share_id)
+                {
+                    if let Some(ref mut editor) = state.ignore_editor {
+                        render_ignore_editor(ui, editor, sync, &p);
+                    }
                 }
             })
-            .w(540.0)
-            .p(20.0)
-            .gap(10.0)
+            .w_frac(1.0)
+            .p(12.0)
+            .gap(8.0)
             .bg(p.surface)
             .bd(1.0, p.border)
-            .r(4.0);
-        });
-        if !open {
-            state.show_conflict_modal = false;
+            .r(6.0);
         }
+    }
+
+    // Ignored Remote Shares
+    if !snap.ignored_shares.is_empty() {
+        ui.col(|ui| {
+            ui.txt(&format!("Ignored Remote Shares ({})", snap.ignored_shares.len()))
+                .sz(12.0)
+                .bold()
+                .fg(p.muted);
+            for preview in &snap.ignored_shares {
+                ui.row(|ui| {
+                    ui.txt(&preview.name).sz(12.0).fg(p.muted);
+                    if ui
+                        .btn("Show Again")
+                        .sz(11.0)
+                        .px(8.0)
+                        .py(4.0)
+                        .bg(p.surface_alt)
+                        .bd(1.0, p.border)
+                        .fg(p.text)
+                        .clicked()
+                    {
+                        sync.send(SyncCommand::UnignoreRemoteShare(preview.share_id.clone()));
+                    }
+                })
+                .w_frac(1.0)
+                .justify_between()
+                .align_center();
+            }
+        })
+        .w_frac(1.0)
+        .p(12.0)
+        .gap(6.0)
+        .bg(p.surface)
+        .bd(1.0, p.border)
+        .r(6.0);
     }
 }
 
-fn telemetry_col(
+fn render_telemetry_strip(ui: &mut UiContext, snap: &UiSnapshot, p: &Palette) {
+    let relay_val = if snap.relay_connected {
+        let mode = if snap.ws_connected { "Live WS" } else { "HTTP" };
+        match snap.relay_latency_ms {
+            Some(ms) => format!("{ms} ms ({mode})"),
+            None => format!("Connected ({mode})"),
+        }
+    } else {
+        "Offline".to_string()
+    };
+
+    let speed_val = format!(
+        "Up {}/s  |  Down {}/s",
+        format_bytes(snap.upload_bps),
+        format_bytes(snap.download_bps)
+    );
+
+    let cache_val = match &snap.cache_status {
+        Some(c) => format!("{} / {}", format_bytes(c.used_bytes), format_bytes(c.max_bytes)),
+        None => "-".to_string(),
+    };
+
+    let online_devices = snap.devices.iter().filter(|d| d.online).count();
+    let devices_val = format!("{online_devices} / {} online", snap.devices.len().max(1));
+
+    ui.row(|ui| {
+        metric_cell(
+            ui,
+            "RELAY",
+            &relay_val,
+            if snap.relay_connected {
+                p.ok_green
+            } else {
+                p.warn_amber
+            },
+            p,
+        );
+        metric_cell(ui, "THROUGHPUT", &speed_val, p.text, p);
+        metric_cell(ui, "DEVICES", &devices_val, p.text, p);
+        metric_cell(ui, "RELAY CACHE", &cache_val, p.text, p);
+    })
+    .w_frac(1.0)
+    .p(12.0)
+    .gap(16.0)
+    .bg(p.surface)
+    .bd(1.0, p.border)
+    .r(6.0)
+    .justify_between();
+}
+
+fn metric_cell(ui: &mut UiContext, label: &str, value: &str, color: lumenic::Color, p: &Palette) {
+    ui.col(|ui| {
+        ui.txt(label).sz(10.0).fg(p.muted);
+        ui.txt(value).sz(12.5).bold().fg(color);
+    })
+    .gap(2.0);
+}
+
+fn render_ignore_editor(
     ui: &mut UiContext,
-    label: &str,
-    value: &str,
-    val_color: lumenic::Color,
+    editor: &mut IgnoreEditorState,
+    sync: &SyncHandle,
     p: &Palette,
 ) {
+    ui.divider().bg(p.border);
+
     ui.col(|ui| {
-        ui.txt(label).sz(10.5).tracking(0.08).fg(p.muted);
-        ui.txt(value).sz(14.0).mono().fg(val_color);
+        ui.txt("Project Presets (synced to all devices):")
+            .sz(11.5)
+            .bold()
+            .fg(p.text);
+
+        ui.row(|ui| {
+            for preset in IGNORE_PRESETS {
+                let enabled = preset_is_enabled(&editor.patterns, preset);
+                if ui
+                    .btn(preset.name)
+                    .sz(11.0)
+                    .px(9.0)
+                    .py(4.0)
+                    .bg(if enabled { p.accent } else { p.bg })
+                    .bd(1.0, if enabled { p.accent } else { p.border })
+                    .fg(if enabled { p.bg } else { p.muted })
+                    .clicked()
+                {
+                    toggle_preset_patterns(&mut editor.patterns, preset, !enabled);
+                    editor.test_cache_dirty = true;
+                }
+            }
+        })
+        .gap(6.0)
+        .wrap();
+
+        ui.row(|ui| {
+            ui.input("ignore_new_pat", &mut editor.new_pattern)
+                .w_frac(1.0)
+                .bg(p.bg)
+                .bd(1.0, p.border)
+                .px(8.0)
+                .py(5.0);
+            if ui
+                .btn("Add Pattern")
+                .sz(11.5)
+                .px(10.0)
+                .py(5.0)
+                .bg(p.surface_alt)
+                .bd(1.0, p.border)
+                .fg(p.text)
+                .clicked()
+            {
+                let pat = editor.new_pattern.text().trim().to_string();
+                if !pat.is_empty() && !editor.patterns.iter().any(|x| x == &pat) {
+                    editor.patterns.push(pat);
+                    editor.new_pattern.set_text("");
+                    editor.test_cache_dirty = true;
+                }
+            }
+        })
+        .w_frac(1.0)
+        .gap(6.0)
+        .align_center();
+
+        if !editor.patterns.is_empty() {
+            let mut remove_idx: Option<usize> = None;
+            ui.row(|ui| {
+                for (idx, pat) in editor.patterns.iter().enumerate() {
+                    if ui
+                        .btn(&format!("{pat} x"))
+                        .sz(10.5)
+                        .px(7.0)
+                        .py(3.0)
+                        .bg(p.bg)
+                        .bd(1.0, p.border)
+                        .fg(p.muted)
+                        .clicked()
+                    {
+                        remove_idx = Some(idx);
+                    }
+                }
+            })
+            .gap(4.0)
+            .wrap();
+            if let Some(idx) = remove_idx {
+                editor.patterns.remove(idx);
+                editor.test_cache_dirty = true;
+            }
+        }
+
+        // Cached Test Path preview
+        ui.row(|ui| {
+            ui.txt("Test path:").sz(11.5).fg(p.muted);
+            ui.input("ignore_test_path", &mut editor.test_path)
+                .w(240.0)
+                .bg(p.bg)
+                .bd(1.0, p.border)
+                .px(8.0)
+                .py(4.0);
+            let cur_test = editor.test_path.text().to_string();
+            if editor.test_cache_dirty || cur_test != editor.last_tested_path {
+                editor.last_tested_path = cur_test.clone();
+                editor.test_cache_dirty = false;
+                editor.last_test_ignored = if cur_test.trim().is_empty() {
+                    None
+                } else {
+                    let filter = IgnoreFilter::from_patterns(&editor.local_path, &editor.patterns);
+                    Some(filter.test_path_ignored(&cur_test))
+                };
+            }
+            if let Some(ignored) = editor.last_test_ignored {
+                ui.txt(if ignored { "Ignored" } else { "Will Sync" })
+                    .sz(11.5)
+                    .bold()
+                    .fg(if ignored { p.warn_amber } else { p.ok_green });
+            }
+        })
+        .gap(8.0)
+        .align_center();
+
+        ui.row(|ui| {
+            if ui
+                .btn("Save Ignore Rules")
+                .sz(11.5)
+                .px(12.0)
+                .py(5.0)
+                .bg(p.ok_green)
+                .fg(p.bg)
+                .clicked()
+            {
+                sync.send(SyncCommand::UpdateShareIgnore {
+                    share_id: editor.share_id.clone(),
+                    patterns: editor.patterns.clone(),
+                });
+            }
+        });
     })
-    .grow(1.0)
-    .gap(4.0);
+    .w_frac(1.0)
+    .p(10.0)
+    .gap(8.0)
+    .bg(p.surface_alt)
+    .r(4.0);
 }

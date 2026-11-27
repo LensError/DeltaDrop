@@ -1,18 +1,20 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Json, Router};
 use deltadrop_common::{
-    decode_hex_32, AdminUserInfo, AuthParamsResponse, ChunkAckRequest, CreateUserRequest,
-    DeviceInfo, FolderManifestPayload, LoginRequest, LoginResponse, PendingSyncRequest,
-    RegisterDeviceRequest, RelayCacheStatus, SyncRequestPayload, UpdateUserRequest, UserRole,
-    WsSignal, MAX_CHUNK_HTTP_BYTES,
+    decode_hex_32, is_valid_chunk_id, is_valid_share_id, AdminUserInfo, AuthParamsResponse,
+    CreateUserRequest, DeviceInfo, HasChunksRequest, HasChunksResponse, LoginRequest,
+    LoginResponse, PendingReseed, PutShareRequest, PutShareResponse, RelayCacheStatus,
+    ReplaceDeviceRequest, ReseedRequest, ShareRecord, UpdateUserRequest, UserRole, WsClientMsg,
+    WsServerMsg, MAX_CHUNK_HTTP_BYTES, MAX_MANIFEST_HTTP_BYTES,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
@@ -20,10 +22,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::auth::{
-    auth_rate_limit_middleware, generate_random_hex_32, hash_auth_key, hash_session_token,
-    session_auth_middleware, verify_auth_key, AuthUser,
+    auth_rate_limit_middleware, check_network_gate, gate_middleware, generate_random_hex_32,
+    hash_auth_key, hash_session_token, lookup_session_user, session_auth_middleware,
+    verify_auth_key, AuthUser,
 };
-use crate::db::{is_valid_chunk_id, purge_user_db_rows, user_chunks_usage};
+use crate::db::{purge_user_db_rows, user_chunks_usage};
 use crate::storage::{evict_lru_user_chunks, now_ms};
 use crate::AppState;
 
@@ -34,34 +37,7 @@ pub struct AuthParamsQuery {
     pub username: String,
 }
 
-#[derive(Deserialize)]
-pub struct ManifestsQuery {
-    pub device_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct SyncRequestsQuery {
-    pub source_device_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct ChunkPutQuery {
-    pub pending_peers: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct WsQuery {
-    pub device_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct ReplaceDeviceBody {
-    pub new_device_id: String,
-    pub encrypted_name: String,
-    pub os: String,
-}
-
-pub fn build_api_v1_router(state: AppState) -> Router<AppState> {
+pub fn build_api_v2_router(state: AppState) -> Router<AppState> {
     let auth_routes = Router::new()
         .route("/auth/params", get(get_auth_params))
         .route("/auth/login", post(post_login))
@@ -79,36 +55,41 @@ pub fn build_api_v1_router(state: AppState) -> Router<AppState> {
             "/admin/users/:id",
             patch(admin_update_user).delete(admin_delete_user),
         )
-        .route("/devices/register", post(register_device))
         .route("/devices", get(list_devices))
         .route("/devices/:device_id", delete(delete_device))
         .route("/devices/:device_id/replace", post(replace_device))
+        .route("/shares", get(list_shares))
         .route(
-            "/manifests/:folder_id",
-            put(put_manifest).delete(delete_manifest),
+            "/shares/:share_id",
+            get(get_share)
+                .put(put_share)
+                .delete(delete_share)
+                .layer(DefaultBodyLimit::max(MAX_MANIFEST_HTTP_BYTES)),
         )
-        .route("/manifests", get(list_manifests))
-        .route(
-            "/sync-requests",
-            post(create_sync_request).get(list_sync_requests),
-        )
-        .route("/sync-requests/:id/fulfill", post(fulfill_sync_request))
+        .route("/shares/:share_id/reseed", post(post_reseed_request))
+        .route("/reseed-requests", get(list_reseed_requests))
+        .route("/chunks/has", post(post_chunks_has))
         .route(
             "/chunks/:chunk_id",
             put(put_user_chunk)
                 .get(get_user_chunk)
                 .layer(DefaultBodyLimit::max(MAX_CHUNK_HTTP_BYTES)),
         )
-        .route("/chunks/ack", post(ack_user_chunks))
         .route("/cache/status", get(get_cache_status))
-        .route("/ws", get(ws_handler))
-        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
-            state,
+            state.clone(),
             session_auth_middleware,
         ));
 
-    Router::new().nest("/api/v1", auth_routes.merge(protected_routes))
+    let gated_http = auth_routes
+        .merge(protected_routes)
+        .layer(middleware::from_fn_with_state(state, gate_middleware));
+
+    // WebSocket authenticates via its first JSON frame (token + optional gate) so secrets never appear in URLs.
+    let ws_route = Router::new().route("/ws", get(ws_handler));
+
+    Router::new().nest("/api/v2", gated_http.merge(ws_route))
 }
 
 async fn get_auth_params(
@@ -215,7 +196,8 @@ async fn post_login(
              ON CONFLICT(user_id, device_id) DO UPDATE SET
                 encrypted_name = CASE WHEN excluded.encrypted_name != '' THEN excluded.encrypted_name ELSE devices.encrypted_name END,
                 os = CASE WHEN excluded.os != '' THEN excluded.os ELSE devices.os END,
-                last_seen_ms = excluded.last_seen_ms",
+                last_seen_ms = excluded.last_seen_ms,
+                online = 1",
             params![
                 user_id,
                 req.device_id.trim(),
@@ -426,38 +408,6 @@ async fn admin_delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn register_device(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Json(req): Json<RegisterDeviceRequest>,
-) -> Result<StatusCode, StatusCode> {
-    if req.device_id.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    db.execute(
-        "INSERT INTO devices (user_id, device_id, encrypted_name, os, last_seen_ms, online)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1)
-         ON CONFLICT(user_id, device_id) DO UPDATE SET
-            encrypted_name = excluded.encrypted_name,
-            os = excluded.os,
-            last_seen_ms = excluded.last_seen_ms,
-            online = 1",
-        params![
-            user.user_id,
-            req.device_id.trim(),
-            req.encrypted_name,
-            req.os,
-            now_ms()
-        ],
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn list_devices(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -478,16 +428,15 @@ async fn list_devices(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut stmt = db
         .prepare(
-            "SELECT device_id, encrypted_name, os, last_seen_ms, online
+            "SELECT device_id, encrypted_name, os, last_seen_ms
              FROM devices WHERE user_id = ?1 ORDER BY last_seen_ms DESC",
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let rows = stmt
         .query_map(params![user.user_id], |r| {
             let device_id: String = r.get(0)?;
-            let db_online: i64 = r.get(4)?;
             Ok(DeviceInfo {
-                online: ws_online.contains(&device_id) || db_online != 0,
+                online: ws_online.contains(&device_id),
                 device_id,
                 encrypted_name: r.get(1)?,
                 os: r.get(2)?,
@@ -512,12 +461,7 @@ async fn delete_device(
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
-        "DELETE FROM sync_requests WHERE user_id = ?1 AND (source_device_id = ?2 OR target_device_id = ?2)",
-        params![user.user_id, device_id],
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    db.execute(
-        "DELETE FROM folder_manifests WHERE user_id = ?1 AND device_id = ?2",
+        "DELETE FROM sessions WHERE user_id = ?1 AND device_id = ?2",
         params![user.user_id, device_id],
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -533,9 +477,10 @@ async fn replace_device(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     AxumPath(old_device_id): AxumPath<String>,
-    Json(req): Json<ReplaceDeviceBody>,
+    Json(req): Json<ReplaceDeviceRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    if req.new_device_id.trim().is_empty() {
+    let new_id = req.new_device_id.trim();
+    if new_id.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
     let db = state
@@ -543,13 +488,8 @@ async fn replace_device(
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
-        "UPDATE OR IGNORE folder_manifests SET device_id = ?1 WHERE user_id = ?2 AND device_id = ?3",
-        params![req.new_device_id.trim(), user.user_id, old_device_id],
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    db.execute(
-        "UPDATE sync_requests SET target_device_id = ?1 WHERE user_id = ?2 AND target_device_id = ?3",
-        params![req.new_device_id.trim(), user.user_id, old_device_id],
+        "UPDATE shares SET owner_device_id = ?1 WHERE user_id = ?2 AND owner_device_id = ?3",
+        params![new_id, user.user_id, old_device_id],
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
@@ -565,225 +505,35 @@ async fn replace_device(
             os = excluded.os,
             last_seen_ms = excluded.last_seen_ms,
             online = 1",
-        params![
-            user.user_id,
-            req.new_device_id.trim(),
-            req.encrypted_name,
-            req.os,
-            now_ms()
-        ],
+        params![user.user_id, new_id, req.encrypted_name, req.os, now_ms()],
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn put_manifest(
+async fn list_shares(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-    AxumPath(folder_id): AxumPath<String>,
-    Json(payload): Json<FolderManifestPayload>,
-) -> Result<StatusCode, StatusCode> {
-    if payload.device_id.trim().is_empty() || folder_id.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.execute(
-            "INSERT INTO folder_manifests (user_id, device_id, folder_id, encrypted_meta_b64, version, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(user_id, device_id, folder_id) DO UPDATE SET
-                encrypted_meta_b64 = excluded.encrypted_meta_b64,
-                version = excluded.version,
-                updated_at_ms = excluded.updated_at_ms",
-            params![
-                user.user_id,
-                payload.device_id,
-                folder_id,
-                payload.encrypted_meta_b64,
-                payload.version as i64,
-                now_ms()
-            ],
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-    let dev_id = payload.device_id.clone();
-    push_ws_to_user(
-        &state,
-        &user.user_id,
-        Some(&dev_id),
-        &WsSignal::ManifestUpdated {
-            device_id: payload.device_id,
-            folder_id,
-            version: payload.version,
-        },
-    );
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn list_manifests(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Query(q): Query<ManifestsQuery>,
-) -> Result<Json<Vec<FolderManifestPayload>>, StatusCode> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut out = Vec::new();
-    if let Some(ref did) = q.device_id {
-        let mut stmt = db
-            .prepare(
-                "SELECT device_id, folder_id, encrypted_meta_b64, version, updated_at_ms
-                 FROM folder_manifests WHERE user_id = ?1 AND device_id = ?2",
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let rows = stmt
-            .query_map(params![user.user_id, did], |r| {
-                Ok(FolderManifestPayload {
-                    device_id: r.get(0)?,
-                    folder_id: r.get(1)?,
-                    encrypted_meta_b64: r.get(2)?,
-                    version: r.get::<_, i64>(3)? as u64,
-                    updated_at_ms: r.get(4)?,
-                })
-            })
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        for item in rows {
-            out.push(item.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
-        }
-    } else {
-        let mut stmt = db
-            .prepare(
-                "SELECT device_id, folder_id, encrypted_meta_b64, version, updated_at_ms
-                 FROM folder_manifests WHERE user_id = ?1",
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let rows = stmt
-            .query_map(params![user.user_id], |r| {
-                Ok(FolderManifestPayload {
-                    device_id: r.get(0)?,
-                    folder_id: r.get(1)?,
-                    encrypted_meta_b64: r.get(2)?,
-                    version: r.get::<_, i64>(3)? as u64,
-                    updated_at_ms: r.get(4)?,
-                })
-            })
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        for item in rows {
-            out.push(item.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
-        }
-    }
-    Ok(Json(out))
-}
-
-async fn delete_manifest(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    AxumPath(folder_id): AxumPath<String>,
-    Query(q): Query<ManifestsQuery>,
-) -> Result<StatusCode, StatusCode> {
-    let Some(did) = q.device_id else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    db.execute(
-        "DELETE FROM folder_manifests WHERE user_id = ?1 AND device_id = ?2 AND folder_id = ?3",
-        params![user.user_id, did, folder_id],
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn create_sync_request(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Json(req): Json<SyncRequestPayload>,
-) -> Result<(StatusCode, Json<PendingSyncRequest>), StatusCode> {
-    let hashes_json =
-        serde_json::to_string(&req.chunk_hashes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let now = now_ms();
-    let id = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.execute(
-            "INSERT INTO sync_requests (user_id, source_device_id, target_device_id, folder_id, chunk_hashes_json, status, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
-            params![
-                user.user_id,
-                req.source_device_id,
-                req.target_device_id,
-                req.folder_id,
-                hashes_json,
-                now
-            ],
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.last_insert_rowid()
-    };
-
-    push_ws_to_device(
-        &state,
-        &user.user_id,
-        &req.source_device_id,
-        &WsSignal::SyncRequest {
-            request_id: id,
-            folder_id: req.folder_id.clone(),
-            target_device_id: req.target_device_id.clone(),
-            chunk_hashes: req.chunk_hashes.clone(),
-        },
-    );
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(PendingSyncRequest {
-            id,
-            source_device_id: req.source_device_id,
-            target_device_id: req.target_device_id,
-            folder_id: req.folder_id,
-            chunk_hashes: req.chunk_hashes,
-            status: "pending".to_string(),
-            created_at_ms: now,
-        }),
-    ))
-}
-
-async fn list_sync_requests(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Query(q): Query<SyncRequestsQuery>,
-) -> Result<Json<Vec<PendingSyncRequest>>, StatusCode> {
+) -> Result<Json<Vec<ShareRecord>>, StatusCode> {
     let db = state
         .db
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut stmt = db
         .prepare(
-            "SELECT id, source_device_id, target_device_id, folder_id, chunk_hashes_json, status, created_at_ms
-             FROM sync_requests
-             WHERE user_id = ?1 AND source_device_id = ?2 AND status = 'pending'
-             ORDER BY id ASC",
+            "SELECT share_id, owner_device_id, last_writer_device_id, version, encrypted_manifest_b64, updated_at_ms
+             FROM shares WHERE user_id = ?1 ORDER BY updated_at_ms DESC",
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let rows = stmt
-        .query_map(params![user.user_id, q.source_device_id], |r| {
-            let hashes_json: String = r.get(4)?;
-            let chunk_hashes: Vec<String> = serde_json::from_str(&hashes_json).unwrap_or_default();
-            Ok(PendingSyncRequest {
-                id: r.get(0)?,
-                source_device_id: r.get(1)?,
-                target_device_id: r.get(2)?,
-                folder_id: r.get(3)?,
-                chunk_hashes,
-                status: r.get(5)?,
-                created_at_ms: r.get(6)?,
+        .query_map(params![user.user_id], |r| {
+            Ok(ShareRecord {
+                share_id: r.get(0)?,
+                owner_device_id: r.get(1)?,
+                last_writer_device_id: r.get(2)?,
+                version: r.get::<_, i64>(3)? as u64,
+                encrypted_manifest_b64: r.get(4)?,
+                updated_at_ms: r.get(5)?,
             })
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -794,28 +544,303 @@ async fn list_sync_requests(
     Ok(Json(out))
 }
 
-async fn fulfill_sync_request(
+async fn get_share(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-    AxumPath(req_id): AxumPath<i64>,
-) -> Result<StatusCode, StatusCode> {
+    AxumPath(share_id): AxumPath<String>,
+) -> Result<Json<ShareRecord>, StatusCode> {
+    if !is_valid_share_id(&share_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let db = state
         .db
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    db.execute(
-        "DELETE FROM sync_requests WHERE id = ?1 AND user_id = ?2",
-        params![req_id, user.user_id],
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let row: Option<ShareRecord> = db
+        .query_row(
+            "SELECT share_id, owner_device_id, last_writer_device_id, version, encrypted_manifest_b64, updated_at_ms
+             FROM shares WHERE user_id = ?1 AND share_id = ?2",
+            params![user.user_id, share_id],
+            |r| {
+                Ok(ShareRecord {
+                    share_id: r.get(0)?,
+                    owner_device_id: r.get(1)?,
+                    last_writer_device_id: r.get(2)?,
+                    version: r.get::<_, i64>(3)? as u64,
+                    encrypted_manifest_b64: r.get(4)?,
+                    updated_at_ms: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Some(record) = row else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(record))
+}
+
+async fn put_share(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(share_id): AxumPath<String>,
+    Json(req): Json<PutShareRequest>,
+) -> Response {
+    if !is_valid_share_id(&share_id) || req.device_id.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let now = now_ms();
+    let result: Result<PutShareResponse, Box<Response>> = (|| {
+        let mut db = state
+            .db
+            .lock()
+            .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+        let tx = db
+            .transaction()
+            .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+
+        let existing: Option<ShareRecord> = tx
+            .query_row(
+                "SELECT share_id, owner_device_id, last_writer_device_id, version, encrypted_manifest_b64, updated_at_ms
+                 FROM shares WHERE user_id = ?1 AND share_id = ?2",
+                params![user.user_id, share_id],
+                |r| {
+                    Ok(ShareRecord {
+                        share_id: r.get(0)?,
+                        owner_device_id: r.get(1)?,
+                        last_writer_device_id: r.get(2)?,
+                        version: r.get::<_, i64>(3)? as u64,
+                        encrypted_manifest_b64: r.get(4)?,
+                        updated_at_ms: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+
+        let new_version = match existing {
+            None => {
+                if req.base_version != 0 {
+                    return Err(Box::new(StatusCode::CONFLICT.into_response()));
+                }
+                let owner = if req.owner_device_id.trim().is_empty() {
+                    req.device_id.trim()
+                } else {
+                    req.owner_device_id.trim()
+                };
+                tx.execute(
+                    "INSERT INTO shares (user_id, share_id, owner_device_id, last_writer_device_id, version, encrypted_manifest_b64, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+                    params![
+                        user.user_id,
+                        share_id,
+                        owner,
+                        req.device_id.trim(),
+                        req.encrypted_manifest_b64,
+                        now
+                    ],
+                )
+                .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+                1u64
+            }
+            Some(cur) => {
+                if req.base_version != cur.version {
+                    return Err(Box::new((StatusCode::CONFLICT, Json(cur)).into_response()));
+                }
+                let next_ver = cur.version + 1;
+                tx.execute(
+                    "UPDATE shares
+                     SET last_writer_device_id = ?1, version = ?2, encrypted_manifest_b64 = ?3, updated_at_ms = ?4
+                     WHERE user_id = ?5 AND share_id = ?6",
+                    params![
+                        req.device_id.trim(),
+                        next_ver as i64,
+                        req.encrypted_manifest_b64,
+                        now,
+                        user.user_id,
+                        share_id
+                    ],
+                )
+                .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+                next_ver
+            }
+        };
+
+        tx.commit()
+            .map_err(|_| Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+        Ok(PutShareResponse {
+            version: new_version,
+            updated_at_ms: now,
+        })
+    })();
+
+    match result {
+        Ok(resp) => {
+            let writer_id = req.device_id.trim().to_string();
+            push_ws_to_user(
+                &state,
+                &user.user_id,
+                Some(&writer_id),
+                &WsServerMsg::ShareUpdated {
+                    share_id,
+                    version: resp.version,
+                    writer_device_id: writer_id.clone(),
+                },
+            );
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(err_resp) => *err_resp,
+    }
+}
+
+async fn delete_share(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(share_id): AxumPath<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !is_valid_share_id(&share_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.execute(
+            "DELETE FROM shares WHERE user_id = ?1 AND share_id = ?2",
+            params![user.user_id, share_id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.execute(
+            "DELETE FROM reseed_requests WHERE user_id = ?1 AND share_id = ?2",
+            params![user.user_id, share_id],
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    push_ws_to_user(
+        &state,
+        &user.user_id,
+        None,
+        &WsServerMsg::ShareDeleted { share_id },
+    );
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn post_reseed_request(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    AxumPath(share_id): AxumPath<String>,
+    Json(req): Json<ReseedRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !is_valid_share_id(&share_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let valid_ids: Vec<String> = req
+        .chunk_ids
+        .into_iter()
+        .filter(|cid| is_valid_chunk_id(cid))
+        .collect();
+    if valid_ids.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let now = now_ms();
+    {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        for cid in &valid_ids {
+            let _ = db.execute(
+                "INSERT OR REPLACE INTO reseed_requests (user_id, share_id, chunk_id, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![user.user_id, share_id, cid, now],
+            );
+        }
+    }
+    push_ws_to_user(
+        &state,
+        &user.user_id,
+        Some(req.requester_device_id.trim()),
+        &WsServerMsg::ReseedRequested {
+            share_id,
+            chunk_ids: valid_ids,
+        },
+    );
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn list_reseed_requests(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<PendingReseed>>, StatusCode> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut stmt = db
+        .prepare("SELECT share_id, chunk_id FROM reseed_requests WHERE user_id = ?1")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(params![user.user_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for item in rows {
+        let (sid, cid) = item.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        grouped.entry(sid).or_default().push(cid);
+    }
+    let out = grouped
+        .into_iter()
+        .map(|(share_id, chunk_ids)| PendingReseed {
+            share_id,
+            chunk_ids,
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+async fn post_chunks_has(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<HasChunksRequest>,
+) -> Result<Json<HasChunksResponse>, StatusCode> {
+    let mut missing = Vec::new();
+    let user_dir = state.chunks_dir.join(&user.user_id);
+    let now = now_ms();
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for cid in req.chunk_ids {
+        if !is_valid_chunk_id(&cid) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let exists_db: bool = db
+            .query_row(
+                "SELECT 1 FROM user_chunks WHERE user_id = ?1 AND chunk_id = ?2",
+                params![user.user_id, cid],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .unwrap_or(false);
+        if exists_db && user_dir.join(format!("{cid}.chk")).exists() {
+            let _ = db.execute(
+                "UPDATE user_chunks SET last_accessed_ms = ?1 WHERE user_id = ?2 AND chunk_id = ?3",
+                params![now, user.user_id, cid],
+            );
+        } else {
+            missing.push(cid);
+        }
+    }
+    Ok(Json(HasChunksResponse { missing }))
 }
 
 async fn put_user_chunk(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     AxumPath(chunk_id): AxumPath<String>,
-    Query(q): Query<ChunkPutQuery>,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if !is_valid_chunk_id(&chunk_id) {
@@ -843,48 +868,28 @@ async fn put_user_chunk(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
-    let pending: Vec<String> = q
-        .pending_peers
-        .as_deref()
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    let pending_json = serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_string());
     let now = now_ms();
-
     {
         let db = state
             .db
             .lock()
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB lock".into()))?;
         db.execute(
-            "INSERT INTO user_chunks (user_id, chunk_id, size_bytes, pending_peers_json, created_at_ms, last_accessed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            "INSERT INTO user_chunks (user_id, chunk_id, size_bytes, created_at_ms, last_accessed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(user_id, chunk_id) DO UPDATE SET
                 size_bytes = excluded.size_bytes,
-                pending_peers_json = excluded.pending_peers_json,
                 last_accessed_ms = excluded.last_accessed_ms",
-            params![user.user_id, chunk_id, body.len() as i64, pending_json, now],
+            params![user.user_id, chunk_id, body.len() as i64, now],
         )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-
-    evict_lru_user_chunks(&state.db, &state.chunks_dir, state.max_bytes);
-    for peer_id in &pending {
-        push_ws_to_device(
-            &state,
-            &user.user_id,
-            peer_id,
-            &WsSignal::ChunkAvailable {
-                folder_id: String::new(),
-                chunk_id: chunk_id.clone(),
-            },
+        let _ = db.execute(
+            "DELETE FROM reseed_requests WHERE user_id = ?1 AND chunk_id = ?2",
+            params![user.user_id, chunk_id],
         );
     }
 
+    evict_lru_user_chunks(&state.db, &state.chunks_dir, state.max_bytes);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -915,60 +920,6 @@ async fn get_user_chunk(
     ))
 }
 
-async fn ack_user_chunks(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Json(req): Json<ChunkAckRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let mut to_delete = Vec::new();
-    {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        for cid in &req.chunk_ids {
-            let row: Option<String> = db
-                .query_row(
-                    "SELECT pending_peers_json FROM user_chunks WHERE user_id = ?1 AND chunk_id = ?2",
-                    params![user.user_id, cid],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            let Some(pending_json) = row else {
-                continue;
-            };
-            let mut peers: Vec<String> = serde_json::from_str(&pending_json).unwrap_or_default();
-            peers.retain(|p| p != &req.device_id);
-            if peers.is_empty() {
-                db.execute(
-                    "DELETE FROM user_chunks WHERE user_id = ?1 AND chunk_id = ?2",
-                    params![user.user_id, cid],
-                )
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                to_delete.push(cid.clone());
-            } else {
-                let updated = serde_json::to_string(&peers).unwrap_or_else(|_| "[]".to_string());
-                db.execute(
-                    "UPDATE user_chunks SET pending_peers_json = ?1 WHERE user_id = ?2 AND chunk_id = ?3",
-                    params![updated, user.user_id, cid],
-                )
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            }
-        }
-    }
-    for cid in to_delete {
-        let _ = tokio::fs::remove_file(
-            state
-                .chunks_dir
-                .join(&user.user_id)
-                .join(format!("{cid}.chk")),
-        )
-        .await;
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn get_cache_status(
     State(state): State<AppState>,
     Extension(_user): Extension<AuthUser>,
@@ -987,17 +938,54 @@ async fn get_cache_status(
     }))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Query(q): Query<WsQuery>,
-) -> impl IntoResponse {
-    let device_id = q.device_id.trim().to_string();
-    ws.on_upgrade(move |socket| handle_ws(socket, state, user.user_id, device_id))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
-async fn handle_ws(mut socket: WebSocket, state: AppState, user_id: String, device_id: String) {
+async fn handle_ws(mut socket: WebSocket, state: AppState) {
+    let auth_frame = tokio::time::timeout(Duration::from_secs(10), socket.recv()).await;
+    let Ok(Some(Ok(Message::Text(text)))) = auth_frame else {
+        return;
+    };
+    let Ok(WsClientMsg::Auth {
+        token,
+        device_id,
+        gate,
+    }) = serde_json::from_str::<WsClientMsg>(&text)
+    else {
+        let _ = send_ws(&mut socket, &WsServerMsg::AuthError {
+            message: "Expected auth message".into(),
+        })
+        .await;
+        return;
+    };
+    if !check_network_gate(state.network_secret.as_deref(), gate.as_deref()) {
+        let _ = send_ws(&mut socket, &WsServerMsg::AuthError {
+            message: "Invalid network gate".into(),
+        })
+        .await;
+        return;
+    }
+    let device_id = device_id.trim().to_string();
+    if device_id.is_empty() {
+        let _ = send_ws(&mut socket, &WsServerMsg::AuthError {
+            message: "Empty device_id".into(),
+        })
+        .await;
+        return;
+    }
+    let Ok(Some(user)) = lookup_session_user(&state, &token) else {
+        let _ = send_ws(&mut socket, &WsServerMsg::AuthError {
+            message: "Unauthorized".into(),
+        })
+        .await;
+        return;
+    };
+    if send_ws(&mut socket, &WsServerMsg::AuthOk).await.is_err() {
+        return;
+    }
+
+    let user_id = user.user_id;
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     {
         if let Ok(mut map) = state.ws_clients.lock() {
@@ -1010,6 +998,15 @@ async fn handle_ws(mut socket: WebSocket, state: AppState, user_id: String, devi
             );
         }
     }
+    push_ws_to_user(
+        &state,
+        &user_id,
+        Some(&device_id),
+        &WsServerMsg::DeviceStatus {
+            device_id: device_id.clone(),
+            online: true,
+        },
+    );
 
     loop {
         tokio::select! {
@@ -1020,11 +1017,15 @@ async fn handle_ws(mut socket: WebSocket, state: AppState, user_id: String, devi
             }
             incoming = socket.recv() => {
                 match incoming {
+                    Some(Ok(Message::Text(txt))) => {
+                        if let Ok(WsClientMsg::Ping) = serde_json::from_str::<WsClientMsg>(&txt) {
+                            let _ = send_ws(&mut socket, &WsServerMsg::Pong).await;
+                        }
+                    }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = socket.send(Message::Pong(p)).await;
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
                 }
             }
@@ -1040,24 +1041,29 @@ async fn handle_ws(mut socket: WebSocket, state: AppState, user_id: String, devi
             params![now_ms(), user_id, device_id],
         );
     }
+    push_ws_to_user(
+        &state,
+        &user_id,
+        Some(&device_id),
+        &WsServerMsg::DeviceStatus {
+            device_id: device_id.clone(),
+            online: false,
+        },
+    );
 }
 
-fn push_ws_to_device(state: &AppState, user_id: &str, device_id: &str, signal: &WsSignal) {
-    let Ok(json) = serde_json::to_string(signal) else {
-        return;
-    };
-    if let Ok(map) = state.ws_clients.lock() {
-        if let Some(tx) = map.get(&(user_id.to_string(), device_id.to_string())) {
-            let _ = tx.send(json);
-        }
+async fn send_ws(socket: &mut WebSocket, msg: &WsServerMsg) -> Result<(), axum::Error> {
+    if let Ok(json) = serde_json::to_string(msg) {
+        socket.send(Message::Text(json)).await?;
     }
+    Ok(())
 }
 
 fn push_ws_to_user(
     state: &AppState,
     user_id: &str,
     exclude_device: Option<&str>,
-    signal: &WsSignal,
+    signal: &WsServerMsg,
 ) {
     let Ok(json) = serde_json::to_string(signal) else {
         return;

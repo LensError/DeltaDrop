@@ -270,7 +270,7 @@ done
 
 pct exec "$CTID" -- bash -c "apt-get update && apt-get install -y ca-certificates curl"
 pct exec "$CTID" -- useradd --system --home /var/lib/deltadrop --create-home --shell /usr/sbin/nologin deltadrop || true
-pct exec "$CTID" -- mkdir -p /etc/deltadrop /var/lib/deltadrop/blobs
+pct exec "$CTID" -- mkdir -p /etc/deltadrop /var/lib/deltadrop/chunks
 pct exec "$CTID" -- chown -R deltadrop:deltadrop /var/lib/deltadrop
 
 if [[ "$DEPLOY_MODE" == "1" ]]; then

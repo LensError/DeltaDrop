@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use reqwest::Client;
+use lumenic::{HttpClient, HttpLimits, HttpRequest};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -63,7 +63,7 @@ pub fn expected_platform_asset_name() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        "deltadrop-client-macos-universal.tar.gz"
+        "deltadrop-client-macos-arm64.tar.gz"
     }
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
@@ -117,23 +117,24 @@ pub fn restart_self() -> std::io::Result<()> {
     Ok(())
 }
 
-pub async fn check_for_updates(client: &Client) -> Result<UpdateStatus, String> {
-    let resp = client
-        .get(GITHUB_LATEST_URL)
+pub fn check_for_updates() -> Result<UpdateStatus, String> {
+    let req = HttpRequest::get(GITHUB_LATEST_URL)
         .header(
             "User-Agent",
             format!("deltadrop-client/{}", current_version()),
         )
-        .send()
-        .await
-        .map_err(|e| format!("Update check failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API returned {}", resp.status()));
+        .limits(HttpLimits {
+            max_header_bytes: 32 * 1024,
+            max_response_bytes: 4 * 1024 * 1024,
+            max_redirects: 5,
+            timeout_ms: 20_000,
+        });
+    let resp = HttpClient::send_sync(&req).map_err(|e| format!("Update check failed: {e}"))?;
+    if !resp.is_success() {
+        return Err(format!("GitHub API returned HTTP {}", resp.status));
     }
-    let release: GithubRelease = resp
-        .json()
-        .await
-        .map_err(|e| format!("Invalid release JSON: {e}"))?;
+    let release: GithubRelease =
+        serde_json::from_slice(&resp.body).map_err(|e| format!("Invalid release JSON: {e}"))?;
 
     if !is_newer_version(current_version(), &release.tag_name) {
         return Ok(UpdateStatus::UpToDate(current_version().to_string()));
@@ -159,47 +160,47 @@ pub async fn check_for_updates(client: &Client) -> Result<UpdateStatus, String> 
     })
 }
 
-pub async fn download_and_stage_update(
-    client: &Client,
+pub fn download_and_stage_update(
     version: &str,
     asset_url: &str,
     asset_name: &str,
     sums_url: &str,
 ) -> Result<UpdateStatus, String> {
-    let sums_text = client
-        .get(sums_url)
-        .header(
-            "User-Agent",
-            format!("deltadrop-client/{}", current_version()),
-        )
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch SHA256SUMS: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("SHA256SUMS HTTP error: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read SHA256SUMS: {e}"))?;
-
+    let ua = format!("deltadrop-client/{}", current_version());
+    let sums_resp = HttpClient::send_sync(
+        &HttpRequest::get(sums_url)
+            .header("User-Agent", ua.clone())
+            .limits(HttpLimits {
+                max_header_bytes: 32 * 1024,
+                max_response_bytes: 1024 * 1024,
+                max_redirects: 5,
+                timeout_ms: 20_000,
+            }),
+    )
+    .map_err(|e| format!("Failed to fetch SHA256SUMS: {e}"))?;
+    if !sums_resp.is_success() {
+        return Err(format!("SHA256SUMS HTTP {}", sums_resp.status));
+    }
+    let sums_text = String::from_utf8_lossy(&sums_resp.body);
     let expected_hash = parse_sha256_for_asset(&sums_text, asset_name)
         .ok_or_else(|| format!("SHA256SUMS missing entry for {asset_name}"))?;
 
-    let archive_bytes = client
-        .get(asset_url)
-        .header(
-            "User-Agent",
-            format!("deltadrop-client/{}", current_version()),
-        )
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download update: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("Update download HTTP error: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read update bytes: {e}"))?;
+    let asset_resp = HttpClient::send_sync(
+        &HttpRequest::get(asset_url)
+            .header("User-Agent", ua)
+            .limits(HttpLimits {
+                max_header_bytes: 32 * 1024,
+                max_response_bytes: 128 * 1024 * 1024,
+                max_redirects: 5,
+                timeout_ms: 120_000,
+            }),
+    )
+    .map_err(|e| format!("Failed to download update: {e}"))?;
+    if !asset_resp.is_success() {
+        return Err(format!("Update download HTTP {}", asset_resp.status));
+    }
 
-    if !verify_sha256_bytes(&archive_bytes, &expected_hash) {
+    if !verify_sha256_bytes(&asset_resp.body, &expected_hash) {
         return Err("SHA-256 verification failed for downloaded update".to_string());
     }
 
@@ -209,7 +210,7 @@ pub async fn download_and_stage_update(
         .parent()
         .ok_or_else(|| "Current exe has no parent directory".to_string())?;
     let stage_archive = parent.join(format!(".deltadrop-update-{asset_name}"));
-    std::fs::write(&stage_archive, &archive_bytes)
+    std::fs::write(&stage_archive, &asset_resp.body)
         .map_err(|e| format!("Failed to write staged archive: {e}"))?;
 
     let new_bin = extract_binary_from_archive(&stage_archive, parent)?;

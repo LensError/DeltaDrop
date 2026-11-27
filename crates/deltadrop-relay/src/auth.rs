@@ -8,17 +8,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use deltadrop_common::{
-    constant_time_eq_blake3, decode_hex_32, derive_auth_and_vault_keys, encode_hex,
-    verify_peer_token, UserRole, GATE_HEADER,
+    constant_time_eq_blake3, decode_hex_32, derive_auth_and_vault_keys, encode_hex, UserRole,
+    GATE_HEADER,
 };
 use rand::RngCore;
 use rusqlite::{params, OptionalExtension};
 
 use crate::storage::now_ms;
 use crate::AppState;
-
-#[derive(Clone, Debug)]
-pub struct AuthPeer(pub Option<String>);
 
 #[derive(Clone, Debug)]
 pub struct AuthUser {
@@ -45,16 +42,8 @@ pub struct RateLimitEntry {
     pub requests_in_window: u32,
 }
 
-impl AuthPeer {
-    pub fn require_matches(&self, peer: &str) -> Result<(), StatusCode> {
-        if let Some(ref scoped) = self.0 {
-            if scoped != peer {
-                return Err(StatusCode::FORBIDDEN);
-            }
-        }
-        Ok(())
-    }
-}
+#[derive(Clone, Copy, Debug)]
+pub struct SocketAddrWrapper(pub IpAddr);
 
 pub fn hash_session_token(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
@@ -80,8 +69,6 @@ pub fn verify_auth_key(auth_key_bytes: &[u8], phc_hash: &str) -> bool {
         .is_ok()
 }
 
-/// Derives `auth_key` from plaintext `(password, salt_hex)` using the exact same
-/// Argon2id + BLAKE3 domain separation as `deltadrop-client`, for CLI user creation.
 pub fn derive_auth_key_for_cli(password: &str, salt_hex: &str) -> anyhow::Result<[u8; 32]> {
     let salt =
         decode_hex_32(salt_hex).ok_or_else(|| anyhow::anyhow!("Invalid 32-byte salt hex"))?;
@@ -99,22 +86,24 @@ pub fn generate_random_hex_32() -> String {
     encode_hex(&bytes)
 }
 
+pub fn check_network_gate(expected: Option<&str>, provided: Option<&str>) -> bool {
+    match expected.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(exp) => {
+            let prov = provided.unwrap_or("").trim();
+            constant_time_eq_blake3(prov.as_bytes(), exp.as_bytes())
+        }
+    }
+}
+
 pub async fn gate_middleware(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(ref expected) = state.network_secret {
-        if !expected.is_empty() {
-            let provided = req
-                .headers()
-                .get(GATE_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if !constant_time_eq_blake3(provided.as_bytes(), expected.as_bytes()) {
-                return Err(StatusCode::UNAUTHORIZED);
-            }
-        }
+    let provided = req.headers().get(GATE_HEADER).and_then(|v| v.to_str().ok());
+    if !check_network_gate(state.network_secret.as_deref(), provided) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
 }
@@ -136,9 +125,6 @@ fn extract_client_ip(headers: &HeaderMap, req_ext: &axum::http::Extensions) -> I
         .map(|c| c.0 .0)
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
 }
-
-#[derive(Clone, Copy, Debug)]
-pub struct SocketAddrWrapper(pub IpAddr);
 
 pub async fn auth_rate_limit_middleware(
     State(state): State<AppState>,
@@ -209,28 +195,15 @@ pub async fn auth_rate_limit_middleware(
     resp
 }
 
-pub async fn session_auth_middleware(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let header = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    let token = header
-        .strip_prefix("Bearer ")
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+pub fn lookup_session_user(state: &AppState, token: &str) -> Result<Option<AuthUser>, StatusCode> {
     let token_hash = hash_session_token(token);
     let now = now_ms();
-
-    let auth_user = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        db.query_row(
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let row = db
+        .query_row(
             "SELECT u.id, u.username, u.role, u.disabled, s.expires_at_ms
              FROM sessions s
              JOIN users u ON u.id = s.user_id
@@ -247,76 +220,37 @@ pub async fn session_auth_middleware(
             },
         )
         .optional()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let Some((user_id, username, role_str, disabled, expires_at_ms)) = auth_user else {
-        return Err(StatusCode::UNAUTHORIZED);
+    let Some((user_id, username, role_str, disabled, expires_at_ms)) = row else {
+        return Ok(None);
     };
     if disabled != 0 || expires_at_ms <= now {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Ok(None);
     }
-
-    req.extensions_mut().insert(AuthUser {
+    Ok(Some(AuthUser {
         user_id,
         username,
         role: UserRole::from_db(&role_str),
-    });
-    Ok(next.run(req).await)
+    }))
 }
 
-pub async fn auth_middleware(
+pub async fn session_auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let auth_header = req
+    let header = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let Some(header) = auth_header else {
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = header
+        .strip_prefix("Bearer ")
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let Some(auth_user) = lookup_session_user(&state, token)? else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    let Some(token) = header.strip_prefix("Bearer ") else {
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
-    let auth_peer = if !state.auth_token.is_empty()
-        && constant_time_eq_blake3(token.as_bytes(), state.auth_token.as_bytes())
-    {
-        AuthPeer(None)
-    } else if !state.auth_token.is_empty() {
-        if let Some(peer_id) = verify_peer_token(&state.auth_token, token) {
-            AuthPeer(Some(peer_id))
-        } else if validate_session_token(&state, token)? {
-            AuthPeer(None)
-        } else {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    } else if validate_session_token(&state, token)? {
-        AuthPeer(None)
-    } else {
-        return Err(StatusCode::UNAUTHORIZED);
-    };
-
-    req.extensions_mut().insert(auth_peer);
+    req.extensions_mut().insert(auth_user);
     Ok(next.run(req).await)
-}
-
-fn validate_session_token(state: &AppState, token: &str) -> Result<bool, StatusCode> {
-    let token_hash = hash_session_token(token);
-    let now = now_ms();
-    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let row = db
-        .query_row(
-            "SELECT u.disabled, s.expires_at_ms
-             FROM sessions s
-             JOIN users u ON u.id = s.user_id
-             WHERE s.token_hash = ?1",
-            params![token_hash],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(matches!(row, Some((disabled, exp)) if disabled == 0 && exp > now))
 }
